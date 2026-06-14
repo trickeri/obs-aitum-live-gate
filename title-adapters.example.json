@@ -16,21 +16,9 @@
       "enabled": false,
       "accessToken": "KICK_USER_ACCESS_TOKEN_WITH_channel_write_SCOPE"
     },
-    "trovo": {
+    "x": {
       "enabled": false,
-      "clientId": "TROVO_CLIENT_ID",
-      "channelId": "TROVO_NUMERIC_CHANNEL_ID",
-      "accessToken": "TROVO_USER_ACCESS_TOKEN_WITH_manage_messages_SCOPE"
-    },
-    "facebook": {
-      "enabled": false,
-      "liveVideoId": "FACEBOOK_LIVE_VIDEO_ID",
-      "accessToken": "FACEBOOK_PAGE_OR_USER_ACCESS_TOKEN_ALLOWED_TO_EDIT_LIVE_VIDEO",
-      "setDescriptionToo": false
-    },
-    "tiktok": {
-      "enabled": false,
-      "note": "No normal public TikTok LIVE title update API was found; keep this disabled unless a private/partner API is added."
+      "note": "X live Producer / Media Studio title updates are not implemented because no generally available public API was found. Set the title manually in X Producer for now."
     }
   }
 }

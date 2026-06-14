@@ -150,11 +150,9 @@ QString inferPlatform(const QString &name, const QString &endpoint)
 		return QStringLiteral("youtube");
 	if (haystack.contains(QStringLiteral("kick")))
 		return QStringLiteral("kick");
-	if (haystack.contains(QStringLiteral("trovo")))
-		return QStringLiteral("trovo");
-	if (haystack.contains(QStringLiteral("facebook")) || haystack.contains(QStringLiteral("fbcdn")) ||
-	    haystack.contains(QStringLiteral("fb.")))
-		return QStringLiteral("facebook");
+	if (haystack.contains(QStringLiteral("twitter")) || haystack.contains(QStringLiteral("x.com")) ||
+	    haystack.contains(QStringLiteral("pscp.tv")) || haystack.contains(QStringLiteral("periscope")))
+		return QStringLiteral("x");
 	if (haystack.contains(QStringLiteral("tiktok")) || haystack.contains(QStringLiteral("byteoversea")) ||
 	    haystack.contains(QStringLiteral("muscdn")))
 		return QStringLiteral("tiktok");
@@ -309,55 +307,6 @@ TitlePublishResult updateYouTubeTitle(const QJsonObject &config, const QString &
 			.arg(QString::fromUtf8(updateResponse.body))};
 }
 
-TitlePublishResult updateFacebookTitle(const QJsonObject &config, const QString &title)
-{
-	const QString accessToken = configString(config, QStringLiteral("accessToken"));
-	const QString liveVideoId = configString(config, QStringLiteral("liveVideoId"));
-	if (accessToken.isEmpty() || liveVideoId.isEmpty())
-		return {true, false, QStringLiteral("Facebook adapter needs accessToken and liveVideoId.")};
-
-	QUrl url(QStringLiteral("https://graph.facebook.com/v25.0/%1").arg(liveVideoId));
-	QUrlQuery form;
-	form.addQueryItem(QStringLiteral("access_token"), accessToken);
-	form.addQueryItem(QStringLiteral("title"), title);
-	if (config.value(QStringLiteral("setDescriptionToo")).toBool(false))
-		form.addQueryItem(QStringLiteral("description"), title);
-
-	const auto response = sendRequest(
-		"POST", url,
-		{{"Content-Type", "application/x-www-form-urlencoded"}, {"Accept", "application/json"}},
-		form.query(QUrl::FullyEncoded).toUtf8());
-
-	if (response.statusCode >= 200 && response.statusCode < 300)
-		return {true, true, QStringLiteral("Facebook LiveVideo title update requested.")};
-	return {true, false,
-		QStringLiteral("Facebook title update failed (%1): %2").arg(response.statusCode).arg(QString::fromUtf8(response.body))};
-}
-
-TitlePublishResult updateTrovoTitle(const QJsonObject &config, const QString &title)
-{
-	const QString clientId = configString(config, QStringLiteral("clientId"));
-	const QString accessToken = configString(config, QStringLiteral("accessToken"));
-	const QString channelId = configString(config, QStringLiteral("channelId"));
-	if (clientId.isEmpty() || accessToken.isEmpty() || channelId.isEmpty())
-		return {true, false, QStringLiteral("Trovo adapter needs clientId, accessToken, and channelId.")};
-
-	const QJsonObject payload{{QStringLiteral("command"), QStringLiteral("settitle %1").arg(title)},
-				  {QStringLiteral("channel_id"), channelId.toLongLong()}};
-	const auto response = sendRequest(
-		"POST", QUrl(QStringLiteral("https://open-api.trovo.live/openplatform/channels/command")),
-		{{"Authorization", "OAuth " + accessToken.toUtf8()},
-		 {"Client-ID", clientId.toUtf8()},
-		 {"Accept", "application/json"},
-		 {"Content-Type", "application/json"}},
-		QJsonDocument(payload).toJson(QJsonDocument::Compact));
-
-	if (response.statusCode >= 200 && response.statusCode < 300)
-		return {true, true, QStringLiteral("Trovo settitle command sent.")};
-	return {true, false,
-		QStringLiteral("Trovo title update failed (%1): %2").arg(response.statusCode).arg(QString::fromUtf8(response.body))};
-}
-
 TitlePublishResult publishPlatformTitle(const QString &platform, const QJsonObject &adapterConfig, const QString &title)
 {
 	if (platform == QStringLiteral("twitch"))
@@ -366,12 +315,9 @@ TitlePublishResult publishPlatformTitle(const QString &platform, const QJsonObje
 		return updateYouTubeTitle(adapterConfig, title);
 	if (platform == QStringLiteral("kick"))
 		return updateKickTitle(adapterConfig, title);
-	if (platform == QStringLiteral("trovo"))
-		return updateTrovoTitle(adapterConfig, title);
-	if (platform == QStringLiteral("facebook"))
-		return updateFacebookTitle(adapterConfig, title);
-	if (platform == QStringLiteral("tiktok"))
-		return {false, true, QStringLiteral("TikTok title updates are not implemented because no normal public LIVE title API was found.")};
+	if (platform == QStringLiteral("x"))
+		return {false, true,
+			QStringLiteral("X title updates are not implemented because X live Producer/Media Studio does not expose a generally available public title-update API.")};
 	return {false, true, QStringLiteral("No title adapter for platform '%1'.").arg(platform)};
 }
 

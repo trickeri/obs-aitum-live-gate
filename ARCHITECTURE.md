@@ -29,8 +29,7 @@ toggles in one modal, then OBS and selected Aitum outputs start in sequence.
 - Aitum main-output start is button-driven because Aitum 1.0.8 does not expose a
   public main-output proc handler analogous to its vertical output handlers.
 - Provider OAuth token acquisition/refresh is not implemented yet; adapters read manually supplied tokens from plugin config.
-- Platform identity is inferred from configured output names/endpoints. Provider
-  adapters will need explicit account binding.
+- Platform identity is inferred from configured output names/endpoints. Provider\r\n  adapters will need explicit account binding. X rows are first-class for toggling,\r\n  but title updates remain manual until X exposes a suitable live title API.
 
 ## Next milestones
 

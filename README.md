@@ -20,7 +20,7 @@ This repository is the initial implementation scaffold.
 - After OBS reports streaming started, clicks the matching Aitum Multistream dock
   output buttons for the selected Aitum outputs.
 - Publishes titles before OBS starts when a matching title adapter is enabled.
-- Includes adapters for Twitch, YouTube, Kick, Trovo, and an experimental Facebook LiveVideo path.
+- Includes title adapters for Twitch, YouTube, and Kick, plus first-class X platform detection/manual-title handling.
 - Warns and continues by default when title adapters are missing; `strictTitleUpdates` can abort going live on title failures.
 
 ## Important integration notes
@@ -49,10 +49,8 @@ Implemented title update paths:
 - Twitch Helix Modify Channel Information
 - YouTube Live Streaming API `liveBroadcasts.update`
 - Kick public API `PATCH /public/v1/channels`
-- Trovo `channels/command` with `settitle`
-- Experimental Facebook Graph LiveVideo update
 
-TikTok is intentionally not implemented yet because no normal public TikTok LIVE creator title API was found.
+X is detected and shown in the popup, but title updates are manual until X exposes or grants access to a public live Producer/Media Studio title API.
 
 ## Build
 

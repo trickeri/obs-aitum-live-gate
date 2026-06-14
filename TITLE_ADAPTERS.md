@@ -1,6 +1,13 @@
 # Title adapter setup
 
-OBS Aitum Live Gate reads title adapter settings from this plugin's OBS config:
+OBS Aitum Live Gate currently targets the platforms you asked for:
+
+- YouTube
+- Kick
+- X
+- Twitch
+
+It reads title adapter settings from this plugin's OBS config:
 
 ```text
 %APPDATA%\obs-studio\plugin_config\obs-aitum-live-gate\settings.json
@@ -62,54 +69,25 @@ You need:
 - OAuth 2.1 user access token with scope:
   - `channel:write`
 
-### Trovo
+## X status
 
-Implemented via Trovo's official channel command endpoint using `settitle`:
+X is included as a first-class platform so it appears in the popup and can be
+toggled for Aitum output startup. However, title publishing is currently manual:
+X's public developer docs expose the X API for posts/users/etc., and X Help
+documents Media Studio Producer for live RTMP workflows, but I did not find a
+generally available public API endpoint to update a Producer/Media Studio live
+broadcast title.
 
-```http
-POST https://open-api.trovo.live/openplatform/channels/command
-```
-
-You need:
-
-- a Trovo developer application / client ID
-- your Trovo numeric channel ID
-- a user access token with scope:
-  - `manage_messages`
-
-### Facebook
-
-A guarded Facebook adapter is included for existing LiveVideo objects:
-
-```http
-POST https://graph.facebook.com/v25.0/{live-video-id}
-```
-
-You need:
-
-- a Meta developer app if you are automating this beyond local/manual tokens
-- a Page/User token that can edit the LiveVideo
-- the `liveVideoId` you want to update
-
-Facebook Live flows vary depending on whether you create the LiveVideo via API,
-stream to an existing scheduled live, or use a Page workflow. Treat this adapter
-as experimental until tested against your exact Facebook Live setup.
-
-## Not implemented
-
-### TikTok
-
-No normal public TikTok LIVE creator API for changing live titles was found in
-TikTok's public developer docs. The plugin intentionally does not use unofficial
-TikTok scraping/private APIs. If TikTok grants a partner/API route, add it behind
-the existing `tiktok` adapter key.
+For now, set the title manually in X Producer / Media Studio before going live.
+If X grants access to a live Producer API for your account, we can add it behind
+the existing `x` adapter key.
 
 ## Platform detection
 
 For Aitum rows, the plugin infers platform from the output name and RTMP endpoint
-(`twitch`, `youtube`, `kick`, `trovo`, `facebook`, `tiktok`). The inferred value
-is saved as `platform` per row in `settings.json`; you can manually correct it if
-your output name/endpoint is custom.
+(`twitch`, `youtube`, `kick`, `x`). The inferred value is saved as `platform` per
+row in `settings.json`; you can manually correct it if your output name/endpoint
+is custom.
 
 For the OBS main stream row, manually set the saved row's `platform` if you want
 the adapter to update your primary platform title too.
