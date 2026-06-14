@@ -100,4 +100,4 @@ Downloaded asset SHA-256:
 
 ## License
 
-GPL-2.0-or-later, matching the OBS plugin template licensing.
+[MIT](LICENSE)
