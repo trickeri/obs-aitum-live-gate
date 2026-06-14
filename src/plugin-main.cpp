@@ -349,11 +349,7 @@ public:
 			enabledBoxes_.push_back(enabled);
 			grid->addWidget(enabled, rowNumber, 0, Qt::AlignHCenter);
 
-			QString label = row.name;
-			const QString endpoint = displayEndpoint(row.endpoint);
-			if (!endpoint.isEmpty())
-				label += QStringLiteral(" (%1)").arg(endpoint);
-			grid->addWidget(new QLabel(label, this), rowNumber, 1);
+			grid->addWidget(new QLabel(row.name, this), rowNumber, 1);
 
 			auto *title = new QLineEdit(row.title, this);
 			title->setPlaceholderText(QStringLiteral("Tonight's stream title"));
