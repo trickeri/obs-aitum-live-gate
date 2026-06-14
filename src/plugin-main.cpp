@@ -323,14 +323,16 @@ TitlePublishResult publishPlatformTitle(const QString &platform, const QJsonObje
 
 class GoLiveDialog final : public QDialog {
 public:
-	explicit GoLiveDialog(std::vector<PlatformRow> rows, QWidget *parent = nullptr) : QDialog(parent), rows_(std::move(rows))
+	explicit GoLiveDialog(std::vector<PlatformRow> rows, QWidget *parent = nullptr, bool previewOnly = false)
+		: QDialog(parent),
+		  rows_(std::move(rows))
 	{
-		setWindowTitle(text("LiveGate.Title"));
+		setWindowTitle(previewOnly ? text("LiveGate.PreviewTitle") : text("LiveGate.Title"));
 		setModal(true);
 		resize(720, 240);
 
 		auto *root = new QVBoxLayout(this);
-		auto *intro = new QLabel(text("LiveGate.Intro"), this);
+		auto *intro = new QLabel(previewOnly ? text("LiveGate.PreviewIntro") : text("LiveGate.Intro"), this);
 		intro->setWordWrap(true);
 		root->addWidget(intro);
 
@@ -369,8 +371,12 @@ public:
 		}
 
 		auto *buttons = new QDialogButtonBox(this);
-		buttons->addButton(text("LiveGate.GoLive"), QDialogButtonBox::AcceptRole);
-		buttons->addButton(text("LiveGate.Cancel"), QDialogButtonBox::RejectRole);
+		if (previewOnly) {
+			buttons->addButton(text("LiveGate.ClosePreview"), QDialogButtonBox::AcceptRole);
+		} else {
+			buttons->addButton(text("LiveGate.GoLive"), QDialogButtonBox::AcceptRole);
+			buttons->addButton(text("LiveGate.Cancel"), QDialogButtonBox::RejectRole);
+		}
 		connect(buttons, &QDialogButtonBox::accepted, this, &QDialog::accept);
 		connect(buttons, &QDialogButtonBox::rejected, this, &QDialog::reject);
 		root->addWidget(buttons);
@@ -401,6 +407,7 @@ public:
 		if (qApp)
 			qApp->installEventFilter(this);
 		obs_frontend_add_event_callback(&LiveGateController::frontendEvent, this);
+		obs_frontend_add_tools_menu_item("Preview Go Live Gate", &LiveGateController::previewMenuClicked, this);
 		obs_log(LOG_INFO, "OBS Aitum Live Gate loaded");
 	}
 
@@ -450,6 +457,13 @@ private:
 			self->pendingAitumIds_.clear();
 			self->programmaticStart_ = false;
 		}
+	}
+
+	static void previewMenuClicked(void *data)
+	{
+		auto *self = static_cast<LiveGateController *>(data);
+		if (self)
+			QTimer::singleShot(0, self, [self] { self->showPreviewDialog(); });
 	}
 
 	bool isStartStreamingButton(const QPushButton *button) const
@@ -508,6 +522,14 @@ private:
 
 		programmaticStart_ = true;
 		obs_frontend_streaming_start();
+	}
+
+	void showPreviewDialog()
+	{
+		auto rows = loadRows();
+		auto *mainWindow = reinterpret_cast<QWidget *>(obs_frontend_get_main_window());
+		GoLiveDialog dialog(std::move(rows), mainWindow, true);
+		dialog.exec();
 	}
 
 	std::vector<PlatformRow> loadRows() const
