@@ -1,0 +1,36 @@
+{
+  "titleAdapters": {
+    "strictTitleUpdates": false,
+    "twitch": {
+      "enabled": false,
+      "clientId": "TWITCH_APP_CLIENT_ID",
+      "broadcasterId": "TWITCH_NUMERIC_BROADCASTER_USER_ID",
+      "accessToken": "TWITCH_USER_ACCESS_TOKEN_WITH_channel_manage_broadcast"
+    },
+    "youtube": {
+      "enabled": false,
+      "broadcastId": "YOUTUBE_LIVE_BROADCAST_ID",
+      "accessToken": "GOOGLE_OAUTH_ACCESS_TOKEN_WITH_youtube_SCOPE"
+    },
+    "kick": {
+      "enabled": false,
+      "accessToken": "KICK_USER_ACCESS_TOKEN_WITH_channel_write_SCOPE"
+    },
+    "trovo": {
+      "enabled": false,
+      "clientId": "TROVO_CLIENT_ID",
+      "channelId": "TROVO_NUMERIC_CHANNEL_ID",
+      "accessToken": "TROVO_USER_ACCESS_TOKEN_WITH_manage_messages_SCOPE"
+    },
+    "facebook": {
+      "enabled": false,
+      "liveVideoId": "FACEBOOK_LIVE_VIDEO_ID",
+      "accessToken": "FACEBOOK_PAGE_OR_USER_ACCESS_TOKEN_ALLOWED_TO_EDIT_LIVE_VIDEO",
+      "setDescriptionToo": false
+    },
+    "tiktok": {
+      "enabled": false,
+      "note": "No normal public TikTok LIVE title update API was found; keep this disabled unless a private/partner API is added."
+    }
+  }
+}

@@ -19,8 +19,9 @@ This repository is the initial implementation scaffold.
 - Starts OBS programmatically when **Go Live** is accepted.
 - After OBS reports streaming started, clicks the matching Aitum Multistream dock
   output buttons for the selected Aitum outputs.
-- Logs queued titles so platform title publishing can be wired behind a stable
-  adapter without blocking the start-gate UI work.
+- Publishes titles before OBS starts when a matching title adapter is enabled.
+- Includes adapters for Twitch, YouTube, Kick, Trovo, and an experimental Facebook LiveVideo path.
+- Warns and continues by default when title adapters are missing; `strictTitleUpdates` can abort going live on title failures.
 
 ## Important integration notes
 
@@ -39,19 +40,19 @@ buttons (`objectName == "canvasStream"`) and clicking the buttons whose parent
 That is intentionally isolated in `LiveGateController::applyAitumSelections()`
 so it can be replaced later if Aitum adds a stable public API.
 
-## Title publishing adapter seam
+## Title publishing adapters
 
-The popup captures a title per platform, but Aitum output config only contains
-stream endpoints/keys, not platform OAuth credentials or metadata APIs. The
-current code persists and logs titles. The next implementation step is to add
-provider adapters, for example:
+Title adapters are configured in this plugin's OBS config. See `TITLE_ADAPTERS.md` and `title-adapters.example.json` for required app registrations, OAuth scopes, and token fields.
 
-- Twitch Helix `Modify Channel Information`
-- YouTube Live Broadcast metadata update
-- Kick/TikTok/Facebook equivalents where API access is available
+Implemented title update paths:
 
-Adapters should run before `obs_frontend_streaming_start()` and fail visibly if a
-selected platform's title cannot be updated.
+- Twitch Helix Modify Channel Information
+- YouTube Live Streaming API `liveBroadcasts.update`
+- Kick public API `PATCH /public/v1/channels`
+- Trovo `channels/command` with `settitle`
+- Experimental Facebook Graph LiveVideo update
+
+TikTok is intentionally not implemented yet because no normal public TikTok LIVE creator title API was found.
 
 ## Build
 

@@ -26,3 +26,6 @@
 # Exclude CMake build number cache
 /cmake/.CMakeBuildNumber
 
+
+!TITLE_ADAPTERS.md
+!title-adapters.example.json

@@ -18,7 +18,7 @@ toggles in one modal, then OBS and selected Aitum outputs start in sequence.
    - selected titles/toggles are saved,
    - selected Aitum output names are staged,
    - OBS main streaming starts via `obs_frontend_streaming_start()`.
-5. On `OBS_FRONTEND_EVENT_STREAMING_STARTING`, titles are currently logged.
+5. Before calling `obs_frontend_streaming_start()`, title adapters run for selected rows with non-empty titles.
 6. On `OBS_FRONTEND_EVENT_STREAMING_STARTED`, selected Aitum dock buttons are
    clicked to start matching companion outputs.
 
@@ -28,14 +28,13 @@ toggles in one modal, then OBS and selected Aitum outputs start in sequence.
   websocket, or menu actions are not blocked yet.
 - Aitum main-output start is button-driven because Aitum 1.0.8 does not expose a
   public main-output proc handler analogous to its vertical output handlers.
-- Title fields are captured and persisted, but provider metadata APIs are not
-  implemented yet.
+- Provider OAuth token acquisition/refresh is not implemented yet; adapters read manually supplied tokens from plugin config.
 - Platform identity is inferred from configured output names/endpoints. Provider
   adapters will need explicit account binding.
 
 ## Next milestones
 
-1. Add title provider adapters and a credentials/settings page.
+1. Add OAuth helper UI/token refresh and a credentials/settings page.
 2. Add a non-button start path guard if OBS exposes a cancellable pre-start hook
    or if replacing OBS's start action proves safer.
 3. Add tests around config parsing and settings persistence.
