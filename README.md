@@ -70,6 +70,18 @@ Or use the template script:
 .\.github\scripts\Build-Windows.ps1
 ```
 
+Linux / Arch+KDE handoff:
+
+```bash
+cmake --preset linux-x86_64
+cmake --build --preset linux-x86_64 --config RelWithDebInfo
+scripts/linux/install-aitum-arch.sh
+scripts/linux/install-live-gate.sh
+```
+
+See `docs/LINUX_ARCH_KDE.md` for Arch packages, Flatpak/native OBS paths,
+Aitum `.deb` extraction, and the runtime verification checklist.
+
 ## Installed Aitum companion plugin
 
 For this workstation, Aitum Multistream 1.0.8 was installed from the official
