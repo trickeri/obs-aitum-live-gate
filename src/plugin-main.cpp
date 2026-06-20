@@ -12,6 +12,7 @@ license text.
 
 #include <QApplication>
 #include <QCheckBox>
+#include <QComboBox>
 #include <QDialog>
 #include <QDialogButtonBox>
 #include <QDir>
@@ -20,6 +21,8 @@ license text.
 #include <QFileInfo>
 #include <QGridLayout>
 #include <QGroupBox>
+#include <QHBoxLayout>
+#include <QIcon>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
@@ -28,6 +31,7 @@ license text.
 #include <QMainWindow>
 #include <QMessageBox>
 #include <QMouseEvent>
+#include <QPixmap>
 #include <QNetworkAccessManager>
 #include <QNetworkReply>
 #include <QNetworkRequest>
@@ -35,6 +39,7 @@ license text.
 #include <QPushButton>
 #include <QStringList>
 #include <QTimer>
+#include <QUrl>
 #include <QUrlQuery>
 #include <QVBoxLayout>
 #include <QWidget>
@@ -136,6 +141,27 @@ QString displayEndpoint(const QString &endpoint)
 	trimmed.remove(QStringLiteral("rtmp://"), Qt::CaseInsensitive);
 	trimmed.remove(QStringLiteral("rtmps://"), Qt::CaseInsensitive);
 	return trimmed.section('/', 0, 0);
+}
+
+constexpr int kIconSize = 18;
+
+QString platformIconPath(const QString &platform)
+{
+	// Reuse the platform icons that the Aitum multistream plugin compiles into
+	// its own binary as Qt resources. Both plugins live in the same OBS process
+	// and share one Qt resource registry, so these paths resolve as long as the
+	// Aitum plugin is loaded (it always is by the time this dialog can open).
+	if (platform == QStringLiteral("twitch"))
+		return QStringLiteral(":/aitum/media/twitch.png");
+	if (platform == QStringLiteral("youtube"))
+		return QStringLiteral(":/aitum/media/youtube.png");
+	if (platform == QStringLiteral("kick"))
+		return QStringLiteral(":/aitum/media/kick.png");
+	if (platform == QStringLiteral("x"))
+		return QStringLiteral(":/aitum/media/twitter.png");
+	if (platform == QStringLiteral("tiktok"))
+		return QStringLiteral(":/aitum/media/tiktok.png");
+	return {};
 }
 
 QString inferPlatform(const QString &name, const QString &endpoint)
@@ -257,30 +283,88 @@ TitlePublishResult updateKickTitle(const QJsonObject &config, const QString &tit
 TitlePublishResult updateYouTubeTitle(const QJsonObject &config, const QString &title)
 {
 	const QString accessToken = configString(config, QStringLiteral("accessToken"));
-	const QString broadcastId = configString(config, QStringLiteral("broadcastId"));
-	if (accessToken.isEmpty() || broadcastId.isEmpty())
-		return {true, false, QStringLiteral("YouTube adapter needs accessToken and broadcastId.")};
-
-	QUrl listUrl(QStringLiteral("https://www.googleapis.com/youtube/v3/liveBroadcasts"));
-	QUrlQuery listQuery;
-	listQuery.addQueryItem(QStringLiteral("part"), QStringLiteral("snippet,status,contentDetails"));
-	listQuery.addQueryItem(QStringLiteral("id"), broadcastId);
-	listUrl.setQuery(listQuery);
+	if (accessToken.isEmpty())
+		return {true, false, QStringLiteral("YouTube adapter needs an access token (configure a refreshToken).")};
 
 	const Headers authHeaders{{"Authorization", "Bearer " + accessToken.toUtf8()}, {"Accept", "application/json"}};
-	const auto listResponse = sendRequest("GET", listUrl, authHeaders);
-	if (listResponse.statusCode != 200)
+
+	// Decide which broadcast to retitle. YouTube creates a fresh broadcast per
+	// stream, so unless a fixed broadcastId is pinned in settings we auto-select
+	// the currently live broadcast, falling back to the next scheduled one.
+	const QString pinnedId = configString(config, QStringLiteral("broadcastId"));
+
+	QJsonObject broadcast;
+	if (!pinnedId.isEmpty()) {
+		QUrl listUrl(QStringLiteral("https://www.googleapis.com/youtube/v3/liveBroadcasts"));
+		QUrlQuery listQuery;
+		listQuery.addQueryItem(QStringLiteral("part"), QStringLiteral("snippet,status,contentDetails"));
+		listQuery.addQueryItem(QStringLiteral("id"), pinnedId);
+		listUrl.setQuery(listQuery);
+
+		const auto listResponse = sendRequest("GET", listUrl, authHeaders);
+		if (listResponse.statusCode != 200)
+			return {true, false,
+				QStringLiteral("YouTube broadcast lookup failed (%1): %2")
+					.arg(listResponse.statusCode)
+					.arg(QString::fromUtf8(listResponse.body))};
+
+		const auto items = jsonObjectFromResponse(listResponse).value(QStringLiteral("items")).toArray();
+		if (!items.isEmpty())
+			broadcast = items.first().toObject();
+	} else {
+		// Auto-select the broadcast for this session. We query *all* broadcasts
+		// (not just active/upcoming) because a stream sent to YouTube's reusable
+		// "Default stream" key with monitor/testing enabled sits in the
+		// `ready`/`testing` lifecycle for a while after ingest begins, before
+		// YouTube auto-transitions it to `live`. The old active+upcoming-only
+		// lookup raced that window and gave up (logged "No live or upcoming
+		// broadcast found"). Rank candidates by how far along they are and skip
+		// finished/revoked ones; the furthest-along live session wins.
+		QUrl listUrl(QStringLiteral("https://www.googleapis.com/youtube/v3/liveBroadcasts"));
+		QUrlQuery listQuery;
+		listQuery.addQueryItem(QStringLiteral("part"), QStringLiteral("snippet,status,contentDetails"));
+		listQuery.addQueryItem(QStringLiteral("broadcastStatus"), QStringLiteral("all"));
+		listQuery.addQueryItem(QStringLiteral("broadcastType"), QStringLiteral("all"));
+		listQuery.addQueryItem(QStringLiteral("maxResults"), QStringLiteral("50"));
+		listUrl.setQuery(listQuery);
+
+		const auto listResponse = sendRequest("GET", listUrl, authHeaders);
+		if (listResponse.statusCode != 200)
+			return {true, false,
+				QStringLiteral("YouTube broadcast lookup failed (%1): %2")
+					.arg(listResponse.statusCode)
+					.arg(QString::fromUtf8(listResponse.body))};
+
+		const auto items = jsonObjectFromResponse(listResponse).value(QStringLiteral("items")).toArray();
+		int bestRank = 0;
+		for (const auto &item : items) {
+			const QJsonObject obj = item.toObject();
+			const QString life = obj.value(QStringLiteral("status"))
+						     .toObject()
+						     .value(QStringLiteral("lifeCycleStatus"))
+						     .toString();
+			int rank = 0;
+			if (life == QStringLiteral("live") || life == QStringLiteral("liveStarting"))
+				rank = 4; // already public-live
+			else if (life == QStringLiteral("testing"))
+				rank = 3; // ingest bound, in monitor/preview
+			else if (life == QStringLiteral("ready"))
+				rank = 2; // bound or scheduled, not yet testing
+			else if (life == QStringLiteral("created"))
+				rank = 1; // exists but unbound
+			else
+				continue; // complete, completed, revoked, …
+			if (rank > bestRank) {
+				bestRank = rank;
+				broadcast = obj;
+			}
+		}
+	}
+
+	if (broadcast.isEmpty())
 		return {true, false,
-			QStringLiteral("YouTube broadcast lookup failed (%1): %2")
-				.arg(listResponse.statusCode)
-				.arg(QString::fromUtf8(listResponse.body))};
+			QStringLiteral("No active or pending YouTube broadcast found. Start or schedule your stream first.")};
 
-	const auto root = jsonObjectFromResponse(listResponse);
-	const auto items = root.value(QStringLiteral("items")).toArray();
-	if (items.isEmpty())
-		return {true, false, QStringLiteral("YouTube broadcastId was not found.")};
-
-	QJsonObject broadcast = items.first().toObject();
 	QJsonObject snippet = broadcast.value(QStringLiteral("snippet")).toObject();
 	snippet.insert(QStringLiteral("title"), title);
 	broadcast.insert(QStringLiteral("snippet"), snippet);
@@ -319,6 +403,66 @@ TitlePublishResult publishPlatformTitle(const QString &platform, const QJsonObje
 	return {false, true, QStringLiteral("No title adapter for platform '%1'.").arg(platform)};
 }
 
+QString tokenEndpoint(const QString &platform)
+{
+	if (platform == QStringLiteral("twitch"))
+		return QStringLiteral("https://id.twitch.tv/oauth2/token");
+	if (platform == QStringLiteral("youtube"))
+		return QStringLiteral("https://oauth2.googleapis.com/token");
+	if (platform == QStringLiteral("kick"))
+		return QStringLiteral("https://id.kick.com/oauth/token");
+	return {};
+}
+
+struct TokenRefreshResult {
+	bool ok = false;
+	QString accessToken;
+	QString refreshToken; // non-empty only when the platform rotated it
+	QString error;
+};
+
+// Trade a stored refresh token for a fresh, short-lived access token. This is the
+// OAuth refresh_token grant every platform exposes; we run it right before pushing
+// a title so the access token is always valid even though it expires in ~1 hour.
+TokenRefreshResult refreshAccessToken(const QString &platform, const QJsonObject &config)
+{
+	const QString endpoint = tokenEndpoint(platform);
+	const QString refreshToken = configString(config, QStringLiteral("refreshToken"));
+	const QString clientId = configString(config, QStringLiteral("clientId"));
+	const QString clientSecret = configString(config, QStringLiteral("clientSecret"));
+	if (endpoint.isEmpty())
+		return {false, {}, {}, QStringLiteral("no token endpoint for platform '%1'.").arg(platform)};
+	if (refreshToken.isEmpty() || clientId.isEmpty() || clientSecret.isEmpty())
+		return {false, {}, {}, QStringLiteral("refresh needs clientId, clientSecret, and refreshToken.")};
+
+	const auto enc = [](const QString &value) { return QString::fromUtf8(QUrl::toPercentEncoding(value)); };
+	const QString body =
+		QStringLiteral("grant_type=refresh_token&refresh_token=%1&client_id=%2&client_secret=%3")
+			.arg(enc(refreshToken), enc(clientId), enc(clientSecret));
+
+	const auto response = sendRequest(
+		"POST", QUrl(endpoint),
+		{{"Content-Type", "application/x-www-form-urlencoded"}, {"Accept", "application/json"}}, body.toUtf8());
+
+	if (response.statusCode < 200 || response.statusCode >= 300)
+		return {false, {}, {},
+			QStringLiteral("token refresh failed (%1): %2")
+				.arg(response.statusCode)
+				.arg(QString::fromUtf8(response.body))};
+
+	const auto object = jsonObjectFromResponse(response);
+	const QString accessToken = object.value(QStringLiteral("access_token")).toString();
+	if (accessToken.isEmpty())
+		return {false, {}, {}, QStringLiteral("token endpoint returned no access_token.")};
+
+	// Twitch and Kick (OAuth 2.1) rotate the refresh token on each use, so the
+	// caller must persist the new one. Google keeps the same refresh token.
+	QString rotated = object.value(QStringLiteral("refresh_token")).toString();
+	if (rotated == refreshToken)
+		rotated.clear();
+	return {true, accessToken, rotated, {}};
+}
+
 class GoLiveDialog final : public QDialog {
 public:
 	explicit GoLiveDialog(std::vector<PlatformRow> rows, QWidget *parent = nullptr, bool previewOnly = false)
@@ -340,20 +484,83 @@ public:
 		grid->addWidget(new QLabel(text("LiveGate.Platform"), this), 0, 1);
 		grid->addWidget(new QLabel(text("LiveGate.StreamTitle"), this), 0, 2);
 
-		int rowNumber = 1;
+		// Master title bar: typing here sets every platform's title at once, so the
+		// common case (same title everywhere) is one field. Per-platform titles below
+		// can still be edited afterwards to override/tweak any individual platform.
+		auto *masterLabel = new QLabel(QStringLiteral("All Platforms"), this);
+		QFont masterFont = masterLabel->font();
+		masterFont.setBold(true);
+		masterLabel->setFont(masterFont);
+		grid->addWidget(masterLabel, 1, 1);
+
+		auto *masterTitle = new QLineEdit(this);
+		masterTitle->setPlaceholderText(QStringLiteral("Set title for all platforms…"));
+		grid->addWidget(masterTitle, 1, 2);
+
+		int rowNumber = 2;
 		for (auto &row : rows_) {
 			auto *enabled = new QCheckBox(this);
 			enabled->setChecked(row.enabled);
 			enabledBoxes_.push_back(enabled);
 			grid->addWidget(enabled, rowNumber, 0, Qt::AlignHCenter);
 
-			grid->addWidget(new QLabel(row.name, this), rowNumber, 1);
+			auto *platformCell = new QWidget(this);
+			auto *platformLayout = new QHBoxLayout(platformCell);
+			platformLayout->setContentsMargins(0, 0, 0, 0);
+			platformLayout->setSpacing(6);
+
+			if (row.obsMain) {
+				// The OBS main stream can't be auto-detected from a name/endpoint
+				// like the Aitum rows, so let the user pick its platform here
+				// instead of hand-editing settings.json. The choice is persisted.
+				auto *combo = new QComboBox(platformCell);
+				addPlatformItem(combo, QString(), text("LiveGate.PlatformNone"));
+				addPlatformItem(combo, QStringLiteral("twitch"), QStringLiteral("Twitch"));
+				addPlatformItem(combo, QStringLiteral("youtube"), QStringLiteral("YouTube"));
+				addPlatformItem(combo, QStringLiteral("kick"), QStringLiteral("Kick"));
+				addPlatformItem(combo, QStringLiteral("x"), QStringLiteral("X"));
+				const int selected = combo->findData(row.platform);
+				combo->setCurrentIndex(selected >= 0 ? selected : 0);
+				mainPlatformCombo_ = combo;
+				platformLayout->addWidget(combo);
+			} else {
+				auto *icon = new QLabel(platformCell);
+				icon->setFixedSize(kIconSize, kIconSize);
+				const QPixmap pixmap(platformIconPath(row.platform));
+				if (!pixmap.isNull())
+					icon->setPixmap(pixmap.scaled(kIconSize, kIconSize, Qt::KeepAspectRatio,
+								      Qt::SmoothTransformation));
+				platformLayout->addWidget(icon);
+			}
+			platformLayout->addWidget(new QLabel(row.name, platformCell));
+			platformLayout->addStretch();
+			grid->addWidget(platformCell, rowNumber, 1);
 
 			auto *title = new QLineEdit(row.title, this);
-			title->setPlaceholderText(QStringLiteral("Tonight's stream title"));
+			title->setPlaceholderText(QStringLiteral("Stream Title"));
 			titleEdits_.push_back(title);
 			grid->addWidget(title, rowNumber, 2);
 			rowNumber++;
+		}
+
+		// Editing the master field overwrites every per-platform title. We use
+		// textEdited (user keystrokes only), so programmatic per-row setText below
+		// and any manual per-platform overrides afterwards never feed back into it.
+		connect(masterTitle, &QLineEdit::textEdited, this, [this](const QString &t) {
+			for (auto *edit : titleEdits_)
+				edit->setText(t);
+		});
+
+		// If every platform already carries the same non-empty title, surface it in
+		// the master field so it reflects the current shared state on open.
+		if (!titleEdits_.empty()) {
+			const QString first = titleEdits_.front()->text();
+			const bool allSame =
+				!first.isEmpty() &&
+				std::all_of(titleEdits_.begin(), titleEdits_.end(),
+					    [&](QLineEdit *e) { return e->text() == first; });
+			if (allSame)
+				masterTitle->setText(first);
 		}
 
 		root->addLayout(grid);
@@ -382,14 +589,26 @@ public:
 		for (size_t i = 0; i < updated.size(); i++) {
 			updated[i].enabled = enabledBoxes_[i]->isChecked();
 			updated[i].title = titleEdits_[i]->text().trimmed();
+			if (updated[i].obsMain && mainPlatformCombo_)
+				updated[i].platform = mainPlatformCombo_->currentData().toString();
 		}
 		return updated;
 	}
 
 private:
+	static void addPlatformItem(QComboBox *combo, const QString &platform, const QString &label)
+	{
+		const QPixmap pixmap(platformIconPath(platform));
+		if (!pixmap.isNull())
+			combo->addItem(QIcon(pixmap), label, platform);
+		else
+			combo->addItem(label, platform);
+	}
+
 	std::vector<PlatformRow> rows_;
 	std::vector<QCheckBox *> enabledBoxes_;
 	std::vector<QLineEdit *> titleEdits_;
+	QComboBox *mainPlatformCombo_ = nullptr;
 };
 
 class LiveGateController final : public QObject {
@@ -446,8 +665,16 @@ private:
 
 		if (event == OBS_FRONTEND_EVENT_STREAMING_STARTED) {
 			QTimer::singleShot(1200, self, [self] { self->applyAitumSelections(); });
+			// Give the Aitum YouTube output a head start so the broadcast exists,
+			// then push the deferred YouTube title (retried inside if not ready).
+			QTimer::singleShot(6000, self, [self] { self->publishPendingYouTubeTitles(); });
 			self->programmaticStart_ = false;
-		} else if (event == OBS_FRONTEND_EVENT_STREAMING_STOPPED || event == OBS_FRONTEND_EVENT_STREAMING_STOPPING) {
+		} else if (event == OBS_FRONTEND_EVENT_STREAMING_STOPPING) {
+			// Stop the Aitum outputs we started before we forget which they were.
+			self->setAitumOutputs(false);
+			self->pendingYouTubeRows_.clear();
+			self->programmaticStart_ = false;
+		} else if (event == OBS_FRONTEND_EVENT_STREAMING_STOPPED) {
 			self->pendingAitumIds_.clear();
 			self->programmaticStart_ = false;
 		}
@@ -481,11 +708,18 @@ private:
 		auto rows = loadRows();
 		auto *mainWindow = reinterpret_cast<QWidget *>(obs_frontend_get_main_window());
 		GoLiveDialog dialog(std::move(rows), mainWindow);
-		if (dialog.exec() != QDialog::Accepted)
+		const bool accepted = dialog.exec() == QDialog::Accepted;
+
+		// Persist the edited selections and titles whether the user clicked
+		// Go Live, Cancel, or closed the window, so the dialog reopens with
+		// their previous choices instead of resetting every time.
+		const auto editedRows = dialog.rows();
+		saveRows(editedRows);
+
+		if (!accepted)
 			return;
 
-		lastAcceptedRows_ = dialog.rows();
-		saveRows(lastAcceptedRows_);
+		lastAcceptedRows_ = editedRows;
 
 		pendingAitumIds_.clear();
 		bool startMainStream = false;
@@ -504,14 +738,27 @@ private:
 
 		QStringList titleWarnings;
 		const bool titleUpdatesOk = publishTitles(titleWarnings);
-		if (!titleWarnings.isEmpty()) {
+		if (!titleUpdatesOk) {
 			QMessageBox::warning(mainWindow, text("LiveGate.TitleUpdateWarningTitle"),
 					     text("LiveGate.TitleUpdateWarningText") + QStringLiteral("\n\n") +
 						     titleWarnings.join(QStringLiteral("\n")));
-		}
-		if (!titleUpdatesOk) {
 			obs_log(LOG_WARNING, "Live Gate aborted stream because strict title updates failed");
 			return;
+		}
+		if (!titleWarnings.isEmpty()) {
+			QMessageBox box(mainWindow);
+			box.setIcon(QMessageBox::Warning);
+			box.setWindowTitle(text("LiveGate.TitleUpdateWarningTitle"));
+			box.setText(text("LiveGate.TitleUpdateWarningText") + QStringLiteral("\n\n") +
+				    titleWarnings.join(QStringLiteral("\n")));
+			QPushButton *goLiveButton = box.addButton(text("LiveGate.GoLiveAnyway"), QMessageBox::AcceptRole);
+			box.addButton(text("LiveGate.Cancel"), QMessageBox::RejectRole);
+			box.setDefaultButton(goLiveButton);
+			box.exec();
+			if (box.clickedButton() != goLiveButton) {
+				obs_log(LOG_INFO, "Live Gate aborted stream at the title warning by user choice");
+				return;
+			}
 		}
 
 		programmaticStart_ = true;
@@ -551,7 +798,10 @@ private:
 	void applySaved(PlatformRow &row, const QJsonObject &saved) const
 	{
 		const auto object = saved.value(row.id).toObject();
-		if (object.contains(QStringLiteral("enabled")))
+		// The OBS main stream row drives whether OBS goes live at all (and is
+		// what triggers the Aitum outputs), so always reload it checked rather
+		// than letting a previous unchecked session get it stuck off.
+		if (!row.obsMain && object.contains(QStringLiteral("enabled")))
 			row.enabled = object.value(QStringLiteral("enabled")).toBool(row.enabled);
 		row.platform = object.value(QStringLiteral("platform")).toString(row.platform);
 		row.title = object.value(QStringLiteral("title")).toString(row.title);
@@ -622,12 +872,41 @@ private:
 			obs_log(LOG_WARNING, "Live Gate failed to save settings to %s", settingsPath().toUtf8().constData());
 	}
 
-	bool publishTitles(QStringList &warnings) const
+	// Publishes one row's title: mints a fresh access token from the stored
+	// refresh token when present, pushes the title, and persists a rotated
+	// refresh token (Twitch/Kick) back to settings for next time.
+	TitlePublishResult publishRowTitle(const PlatformRow &row) const
 	{
-		const QJsonObject root = readJsonObject(settingsPath());
-		const QJsonObject adapters = root.value(QStringLiteral("titleAdapters")).toObject();
+		QJsonObject root = readJsonObject(settingsPath());
+		QJsonObject adapters = root.value(QStringLiteral("titleAdapters")).toObject();
+		QJsonObject adapterConfig = adapters.value(row.platform).toObject();
+		if (!adapterConfig.value(QStringLiteral("enabled")).toBool(false))
+			return {true, false, QStringLiteral("%1 adapter is not enabled; title not updated.").arg(row.platform)};
+
+		if (!configString(adapterConfig, QStringLiteral("refreshToken")).isEmpty()) {
+			const auto refreshed = refreshAccessToken(row.platform, adapterConfig);
+			if (!refreshed.ok)
+				return {true, false, refreshed.error};
+			adapterConfig.insert(QStringLiteral("accessToken"), refreshed.accessToken);
+			if (!refreshed.refreshToken.isEmpty()) {
+				adapterConfig.insert(QStringLiteral("refreshToken"), refreshed.refreshToken);
+				adapters.insert(row.platform, adapterConfig);
+				root.insert(QStringLiteral("titleAdapters"), adapters);
+				if (!writeJsonObject(settingsPath(), root))
+					obs_log(LOG_WARNING, "Live Gate failed to persist rotated refresh token to %s",
+						settingsPath().toUtf8().constData());
+			}
+		}
+
+		return publishPlatformTitle(row.platform, adapterConfig, row.title);
+	}
+
+	bool publishTitles(QStringList &warnings)
+	{
+		const QJsonObject adapters = readJsonObject(settingsPath()).value(QStringLiteral("titleAdapters")).toObject();
 		const bool strict = adapters.value(QStringLiteral("strictTitleUpdates")).toBool(false);
 		bool ok = true;
+		pendingYouTubeRows_.clear();
 
 		for (const auto &row : lastAcceptedRows_) {
 			if (!row.enabled || row.title.isEmpty())
@@ -642,18 +921,15 @@ private:
 				continue;
 			}
 
-			const QJsonObject adapterConfig = adapters.value(row.platform).toObject();
-			if (!adapterConfig.value(QStringLiteral("enabled")).toBool(false)) {
-				const QString message =
-					QStringLiteral("%1: %2 adapter is not enabled; title not updated.").arg(row.name, row.platform);
-				warnings.push_back(message);
-				obs_log(LOG_WARNING, "%s", message.toUtf8().constData());
-				if (strict)
-					ok = false;
+			// YouTube only creates the broadcast object once RTMP ingest begins,
+			// so defer its title push to just after streaming starts (with retries)
+			// rather than failing here before there is anything to update.
+			if (row.platform == QStringLiteral("youtube")) {
+				pendingYouTubeRows_.push_back(row);
 				continue;
 			}
 
-			const auto result = publishPlatformTitle(row.platform, adapterConfig, row.title);
+			const auto result = publishRowTitle(row);
 			obs_log(result.success ? LOG_INFO : LOG_WARNING, "%s", result.message.toUtf8().constData());
 			if (!result.success) {
 				warnings.push_back(QStringLiteral("%1: %2").arg(row.name, result.message));
@@ -665,7 +941,42 @@ private:
 		return ok;
 	}
 
-	void applyAitumSelections()
+	// Retried shortly after streaming starts: the YouTube broadcast can take a few
+	// seconds to appear once ingest begins, so keep trying until it lands.
+	void publishPendingYouTubeTitles(int attempt = 0)
+	{
+		static constexpr int kMaxAttempts = 8;
+		static constexpr int kRetryDelayMs = 5000;
+		if (pendingYouTubeRows_.empty())
+			return;
+
+		std::vector<PlatformRow> stillPending;
+		for (const auto &row : pendingYouTubeRows_) {
+			const auto result = publishRowTitle(row);
+			obs_log(result.success ? LOG_INFO : LOG_WARNING, "%s", result.message.toUtf8().constData());
+			if (!result.success)
+				stillPending.push_back(row);
+		}
+		pendingYouTubeRows_ = std::move(stillPending);
+
+		if (pendingYouTubeRows_.empty())
+			return;
+		if (attempt + 1 < kMaxAttempts) {
+			QTimer::singleShot(kRetryDelayMs, this, [this, attempt] { publishPendingYouTubeTitles(attempt + 1); });
+		} else {
+			for (const auto &row : pendingYouTubeRows_)
+				obs_log(LOG_WARNING, "Live Gate gave up updating the YouTube title for '%s'",
+					row.name.toUtf8().constData());
+			pendingYouTubeRows_.clear();
+		}
+	}
+
+	void applyAitumSelections() { setAitumOutputs(true); }
+
+	// Toggle the Aitum output "go live" buttons for the outputs we selected. Used
+	// to start them after OBS goes live and to stop them again when OBS stops, so
+	// the user does not have to click each Aitum output by hand.
+	void setAitumOutputs(bool live)
 	{
 		if (pendingAitumIds_.empty())
 			return;
@@ -690,8 +1001,9 @@ private:
 				continue;
 
 			const bool selected = std::find(pendingAitumIds_.begin(), pendingAitumIds_.end(), outputName) != pendingAitumIds_.end();
-			if (selected && !button->isChecked()) {
-				obs_log(LOG_INFO, "Live Gate starting Aitum output '%s'", outputName.toUtf8().constData());
+			if (selected && button->isChecked() != live) {
+				obs_log(LOG_INFO, "Live Gate %s Aitum output '%s'", live ? "starting" : "stopping",
+					outputName.toUtf8().constData());
 				button->click();
 			}
 		}
@@ -701,6 +1013,7 @@ private:
 	bool programmaticStart_ = false;
 	std::vector<QString> pendingAitumIds_;
 	std::vector<PlatformRow> lastAcceptedRows_;
+	std::vector<PlatformRow> pendingYouTubeRows_;
 };
 
 std::unique_ptr<LiveGateController> controller;

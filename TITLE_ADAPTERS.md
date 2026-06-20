@@ -18,6 +18,23 @@ from `title-adapters.example.json` into that file. Keep `strictTitleUpdates` set
 to `false` while testing; set it to `true` only if you want OBS to abort going
 live whenever a selected platform title cannot be updated.
 
+## Authentication: refresh tokens (recommended)
+
+Access tokens are short-lived (Google ~1 hour, Twitch ~4 hours), so the plugin
+authenticates with the OAuth **refresh token** grant instead of a static access
+token. Store `clientId`, `clientSecret`, and `refreshToken` per platform; at
+go-live the plugin trades the refresh token for a fresh access token, pushes the
+title, and persists any rotated refresh token back to `settings.json` (Twitch and
+Kick rotate theirs; Google keeps the same one).
+
+You authorize once to obtain the refresh token. If an adapter instead only has a
+static `accessToken` and no `refreshToken`, the plugin still uses that token
+directly (handy for a quick test, but it will stop working once that token
+expires).
+
+> Google note: keep your OAuth app's publishing status set to **In production**.
+> While it is in **Testing**, Google expires refresh tokens after 7 days.
+
 ## Implemented adapters
 
 ### Twitch
@@ -30,10 +47,10 @@ PATCH https://api.twitch.tv/helix/channels?broadcaster_id=...
 
 You need:
 
-- a Twitch Developer app / client ID
+- a Twitch Developer app: its **client ID** and **client secret**
 - your numeric broadcaster user ID
-- a **user access token** for that broadcaster with scope:
-  - `channel:manage:broadcast`
+- a **refresh token** for that broadcaster, obtained by authorizing the
+  `channel:manage:broadcast` scope (authorization code grant)
 
 ### YouTube
 
@@ -41,13 +58,18 @@ Implemented with YouTube Live Streaming API `liveBroadcasts.list` followed by
 `liveBroadcasts.update` so the existing broadcast snippet is preserved and only
 the title is changed.
 
+Because YouTube creates a new broadcast object for every stream, the adapter
+auto-selects the broadcast at go-live: it uses the currently `active` broadcast,
+falling back to the next `upcoming` (scheduled) one. You can still pin a specific
+broadcast by setting `broadcastId` in the adapter config, but normally you leave
+it unset.
+
 You need:
 
 - a Google Cloud project with YouTube Data API v3 enabled
-- OAuth consent/app credentials
-- an OAuth access token with YouTube scope, usually:
+- OAuth client credentials: **client ID** and **client secret**
+- a **refresh token** authorized for the YouTube scope:
   - `https://www.googleapis.com/auth/youtube`
-- the target `liveBroadcast` ID
 
 ### Kick
 
@@ -65,8 +87,8 @@ Body:
 
 You need:
 
-- a Kick Dev app
-- OAuth 2.1 user access token with scope:
+- a Kick Dev app: its **client ID** and **client secret**
+- a **refresh token** from the OAuth 2.1 flow authorized with scope:
   - `channel:write`
 
 ## X status

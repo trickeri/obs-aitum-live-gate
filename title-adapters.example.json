@@ -4,17 +4,21 @@
     "twitch": {
       "enabled": false,
       "clientId": "TWITCH_APP_CLIENT_ID",
+      "clientSecret": "TWITCH_APP_CLIENT_SECRET",
       "broadcasterId": "TWITCH_NUMERIC_BROADCASTER_USER_ID",
-      "accessToken": "TWITCH_USER_ACCESS_TOKEN_WITH_channel_manage_broadcast"
+      "refreshToken": "TWITCH_REFRESH_TOKEN_FROM_channel_manage_broadcast_AUTH"
     },
     "youtube": {
       "enabled": false,
-      "broadcastId": "YOUTUBE_LIVE_BROADCAST_ID",
-      "accessToken": "GOOGLE_OAUTH_ACCESS_TOKEN_WITH_youtube_SCOPE"
+      "clientId": "GOOGLE_OAUTH_CLIENT_ID",
+      "clientSecret": "GOOGLE_OAUTH_CLIENT_SECRET",
+      "refreshToken": "GOOGLE_REFRESH_TOKEN_WITH_youtube_SCOPE"
     },
     "kick": {
       "enabled": false,
-      "accessToken": "KICK_USER_ACCESS_TOKEN_WITH_channel_write_SCOPE"
+      "clientId": "KICK_APP_CLIENT_ID",
+      "clientSecret": "KICK_APP_CLIENT_SECRET",
+      "refreshToken": "KICK_REFRESH_TOKEN_WITH_channel_write_SCOPE"
     },
     "x": {
       "enabled": false,
