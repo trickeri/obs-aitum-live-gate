@@ -467,7 +467,8 @@ class GoLiveDialog final : public QDialog {
 public:
 	explicit GoLiveDialog(std::vector<PlatformRow> rows, QWidget *parent = nullptr, bool previewOnly = false)
 		: QDialog(parent),
-		  rows_(std::move(rows))
+		  rows_(std::move(rows)),
+		  previewOnly_(previewOnly)
 	{
 		setWindowTitle(previewOnly ? text("LiveGate.PreviewTitle") : text("LiveGate.Title"));
 		setModal(true);
@@ -581,6 +582,14 @@ public:
 		connect(buttons, &QDialogButtonBox::accepted, this, &QDialog::accept);
 		connect(buttons, &QDialogButtonBox::rejected, this, &QDialog::reject);
 		root->addWidget(buttons);
+
+		// Snapshot the opening state so reject() can tell whether the user
+		// actually changed anything and only then warn before discarding.
+		for (auto *box : enabledBoxes_)
+			initialEnabled_.push_back(box->isChecked());
+		for (auto *edit : titleEdits_)
+			initialTitles_.push_back(edit->text());
+		initialPlatform_ = mainPlatformCombo_ ? mainPlatformCombo_->currentData().toString() : QString();
 	}
 
 	std::vector<PlatformRow> rows() const
@@ -595,7 +604,35 @@ public:
 		return updated;
 	}
 
+	// Guard against losing edits to a stray Cancel/Escape/window-close: if the
+	// user changed any title, go-live toggle, or the OBS main platform, confirm
+	// before discarding. Preview mode never persists anything, so it just closes.
+	void reject() override
+	{
+		if (!previewOnly_ && isDirty()) {
+			const auto choice = QMessageBox::question(this, text("LiveGate.DiscardTitle"),
+								  text("LiveGate.DiscardText"),
+								  QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
+			if (choice != QMessageBox::Yes)
+				return; // keep the dialog open so the user can keep editing
+		}
+		QDialog::reject();
+	}
+
 private:
+	bool isDirty() const
+	{
+		for (size_t i = 0; i < titleEdits_.size(); i++)
+			if (titleEdits_[i]->text() != initialTitles_[i])
+				return true;
+		for (size_t i = 0; i < enabledBoxes_.size(); i++)
+			if (enabledBoxes_[i]->isChecked() != initialEnabled_[i])
+				return true;
+		if (mainPlatformCombo_ && mainPlatformCombo_->currentData().toString() != initialPlatform_)
+			return true;
+		return false;
+	}
+
 	static void addPlatformItem(QComboBox *combo, const QString &platform, const QString &label)
 	{
 		const QPixmap pixmap(platformIconPath(platform));
@@ -606,9 +643,13 @@ private:
 	}
 
 	std::vector<PlatformRow> rows_;
+	bool previewOnly_ = false;
 	std::vector<QCheckBox *> enabledBoxes_;
 	std::vector<QLineEdit *> titleEdits_;
 	QComboBox *mainPlatformCombo_ = nullptr;
+	std::vector<bool> initialEnabled_;
+	std::vector<QString> initialTitles_;
+	QString initialPlatform_;
 };
 
 class LiveGateController final : public QObject {
@@ -710,14 +751,15 @@ private:
 		GoLiveDialog dialog(std::move(rows), mainWindow);
 		const bool accepted = dialog.exec() == QDialog::Accepted;
 
-		// Persist the edited selections and titles whether the user clicked
-		// Go Live, Cancel, or closed the window, so the dialog reopens with
-		// their previous choices instead of resetting every time.
-		const auto editedRows = dialog.rows();
-		saveRows(editedRows);
-
+		// Cancel/Escape/window-close discards: the dialog already confirmed
+		// "Discard changes?" when there were edits, so leave the saved settings
+		// untouched and reopen with the last persisted choices next time.
 		if (!accepted)
 			return;
+
+		// Persist only the choices the user actually committed by going live.
+		const auto editedRows = dialog.rows();
+		saveRows(editedRows);
 
 		lastAcceptedRows_ = editedRows;
 
