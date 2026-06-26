@@ -13,6 +13,7 @@ license text.
 #include <QApplication>
 #include <QCheckBox>
 #include <QComboBox>
+#include <QDateTime>
 #include <QDialog>
 #include <QDialogButtonBox>
 #include <QDir>
@@ -389,6 +390,119 @@ TitlePublishResult updateYouTubeTitle(const QJsonObject &config, const QString &
 			.arg(QString::fromUtf8(updateResponse.body))};
 }
 
+struct BroadcastResult {
+	bool ok = false;
+	QString broadcastId;
+	QString message;
+};
+
+// Pick the ingest stream a new broadcast should bind to. A pinned `streamId` in
+// settings wins; otherwise prefer a configured `streamTitle`, then the reusable
+// "Default stream" key, then whatever the account lists first.
+QString resolveYouTubeStreamId(const QJsonObject &config, const QByteArray &accessToken)
+{
+	const QString pinned = configString(config, QStringLiteral("streamId"));
+	if (!pinned.isEmpty())
+		return pinned;
+
+	QUrl url(QStringLiteral("https://www.googleapis.com/youtube/v3/liveStreams"));
+	QUrlQuery q;
+	q.addQueryItem(QStringLiteral("part"), QStringLiteral("id,snippet"));
+	q.addQueryItem(QStringLiteral("mine"), QStringLiteral("true"));
+	q.addQueryItem(QStringLiteral("maxResults"), QStringLiteral("50"));
+	url.setQuery(q);
+
+	const auto resp = sendRequest("GET", url,
+				      {{"Authorization", "Bearer " + accessToken}, {"Accept", "application/json"}});
+	if (resp.statusCode != 200)
+		return {};
+
+	const auto items = jsonObjectFromResponse(resp).value(QStringLiteral("items")).toArray();
+	const QString wantTitle = configString(config, QStringLiteral("streamTitle"));
+	QString firstId, defaultId;
+	for (const auto &it : items) {
+		const QJsonObject o = it.toObject();
+		const QString id = o.value(QStringLiteral("id")).toString();
+		const QString title = o.value(QStringLiteral("snippet")).toObject().value(QStringLiteral("title")).toString();
+		if (firstId.isEmpty())
+			firstId = id;
+		if (!wantTitle.isEmpty() && title.compare(wantTitle, Qt::CaseInsensitive) == 0)
+			return id;
+		if (title.contains(QStringLiteral("default"), Qt::CaseInsensitive) && defaultId.isEmpty())
+			defaultId = id;
+	}
+	return !defaultId.isEmpty() ? defaultId : firstId;
+}
+
+// Create a fresh YouTube broadcast and bind it to an ingest stream, returning the
+// new broadcast id. This is what lets Live Gate go live without the broadcaster
+// hand-creating a broadcast in YouTube Studio first. It MUST run BEFORE the Aitum
+// YouTube output starts ingesting: the broadcast has to already exist, be bound, and
+// be `ready` so the off->on ingest edge (the Aitum "go live" button click) trips
+// enableAutoStart and YouTube promotes it straight to `live`. monitorStream is left
+// OFF so there is no intermediate testing/preview state to get wedged in (a
+// Studio-created broadcast forces monitor ON, which is what kept sticking on
+// "Preparing stream").
+BroadcastResult createYouTubeBroadcast(const QJsonObject &config, const QString &title)
+{
+	const QString accessToken = configString(config, QStringLiteral("accessToken"));
+	if (accessToken.isEmpty())
+		return {false, {}, QStringLiteral("YouTube adapter needs an access token (configure a refreshToken).")};
+	const QByteArray bearer = "Bearer " + accessToken.toUtf8();
+	const Headers jsonHeaders{{"Authorization", bearer}, {"Accept", "application/json"}, {"Content-Type", "application/json"}};
+
+	const QString startIso = QDateTime::currentDateTimeUtc().addSecs(30).toString(Qt::ISODate);
+	const QJsonObject snippet{{QStringLiteral("title"), title.isEmpty() ? QStringLiteral("Live Stream") : title},
+				  {QStringLiteral("scheduledStartTime"), startIso}};
+	const QJsonObject status{{QStringLiteral("privacyStatus"), QStringLiteral("public")},
+				 {QStringLiteral("selfDeclaredMadeForKids"), false}};
+	const QJsonObject contentDetails{{QStringLiteral("enableAutoStart"), true},
+					 {QStringLiteral("enableAutoStop"), true},
+					 {QStringLiteral("enableDvr"), true},
+					 {QStringLiteral("latencyPreference"), QStringLiteral("low")},
+					 {QStringLiteral("monitorStream"),
+					  QJsonObject{{QStringLiteral("enableMonitorStream"), false}}}};
+	const QJsonObject body{{QStringLiteral("snippet"), snippet},
+			       {QStringLiteral("status"), status},
+			       {QStringLiteral("contentDetails"), contentDetails}};
+
+	QUrl insertUrl(QStringLiteral("https://www.googleapis.com/youtube/v3/liveBroadcasts"));
+	QUrlQuery iq;
+	iq.addQueryItem(QStringLiteral("part"), QStringLiteral("snippet,status,contentDetails"));
+	insertUrl.setQuery(iq);
+	const auto insResp = sendRequest("POST", insertUrl, jsonHeaders, QJsonDocument(body).toJson(QJsonDocument::Compact));
+	if (insResp.statusCode < 200 || insResp.statusCode >= 300)
+		return {false, {},
+			QStringLiteral("YouTube broadcast insert failed (%1): %2")
+				.arg(insResp.statusCode)
+				.arg(QString::fromUtf8(insResp.body))};
+	const QString broadcastId = jsonObjectFromResponse(insResp).value(QStringLiteral("id")).toString();
+	if (broadcastId.isEmpty())
+		return {false, {}, QStringLiteral("YouTube broadcast insert returned no id.")};
+
+	const QString streamId = resolveYouTubeStreamId(config, accessToken.toUtf8());
+	if (streamId.isEmpty())
+		return {false, broadcastId,
+			QStringLiteral("Created broadcast %1 but could not resolve a stream to bind.").arg(broadcastId)};
+
+	QUrl bindUrl(QStringLiteral("https://www.googleapis.com/youtube/v3/liveBroadcasts/bind"));
+	QUrlQuery bq;
+	bq.addQueryItem(QStringLiteral("id"), broadcastId);
+	bq.addQueryItem(QStringLiteral("part"), QStringLiteral("id,contentDetails"));
+	bq.addQueryItem(QStringLiteral("streamId"), streamId);
+	bindUrl.setQuery(bq);
+	const auto bindResp = sendRequest("POST", bindUrl, jsonHeaders);
+	if (bindResp.statusCode < 200 || bindResp.statusCode >= 300)
+		return {false, broadcastId,
+			QStringLiteral("Created broadcast %1 but bind failed (%2): %3")
+				.arg(broadcastId)
+				.arg(bindResp.statusCode)
+				.arg(QString::fromUtf8(bindResp.body))};
+
+	return {true, broadcastId,
+		QStringLiteral("Created and bound YouTube broadcast %1 (autostart on, monitor off).").arg(broadcastId)};
+}
+
 TitlePublishResult publishPlatformTitle(const QString &platform, const QJsonObject &adapterConfig, const QString &title)
 {
 	if (platform == QStringLiteral("twitch"))
@@ -705,10 +819,9 @@ private:
 			return;
 
 		if (event == OBS_FRONTEND_EVENT_STREAMING_STARTED) {
+			// applyAitumSelections starts the other platforms now and schedules
+			// YouTube (plus its deferred title push) on a later, staggered pass.
 			QTimer::singleShot(1200, self, [self] { self->applyAitumSelections(); });
-			// Give the Aitum YouTube output a head start so the broadcast exists,
-			// then push the deferred YouTube title (retried inside if not ready).
-			QTimer::singleShot(6000, self, [self] { self->publishPendingYouTubeTitles(); });
 			self->programmaticStart_ = false;
 		} else if (event == OBS_FRONTEND_EVENT_STREAMING_STOPPING) {
 			// Stop the Aitum outputs we started before we forget which they were.
@@ -1013,12 +1126,104 @@ private:
 		}
 	}
 
-	void applyAitumSelections() { setAitumOutputs(true); }
+	// How long after the other platforms go live before YouTube is started, in ms.
+	// Measured from applyAitumSelections (itself ~1.2s after OBS streaming starts).
+	static constexpr int kYouTubeStartDelayMs = 8000;
+
+	// Which Aitum outputs a start/stop pass should touch. YouTube is staggered so
+	// it never goes live in the same instant as the other platforms.
+	enum class AitumPhase { All, NonYouTube, YouTubeOnly };
+
+	bool isYouTubeOutput(const QString &name) const
+	{
+		for (const auto &row : lastAcceptedRows_) {
+			if (row.name == name)
+				return row.platform == QStringLiteral("youtube");
+		}
+		return false;
+	}
+
+	bool hasPendingYouTube() const
+	{
+		for (const auto &name : pendingAitumIds_) {
+			if (isYouTubeOutput(name))
+				return true;
+		}
+		return false;
+	}
+
+	// Create + bind a fresh YouTube broadcast for the enabled YouTube output, using
+	// the title chosen in the go-live dialog. Runs just before the YouTube ingest so
+	// autostart can promote the new `ready` broadcast to live on the ingest edge.
+	void ensureYouTubeBroadcasts()
+	{
+		if (!hasPendingYouTube())
+			return;
+
+		QJsonObject adapterConfig =
+			readJsonObject(settingsPath()).value(QStringLiteral("titleAdapters")).toObject().value(QStringLiteral("youtube")).toObject();
+		if (!adapterConfig.value(QStringLiteral("enabled")).toBool(false)) {
+			obs_log(LOG_INFO, "Live Gate: YouTube adapter disabled; not creating a broadcast.");
+			return;
+		}
+		if (!configString(adapterConfig, QStringLiteral("refreshToken")).isEmpty()) {
+			const auto refreshed = refreshAccessToken(QStringLiteral("youtube"), adapterConfig);
+			if (!refreshed.ok) {
+				obs_log(LOG_WARNING, "Live Gate: YouTube token refresh failed: %s",
+					refreshed.error.toUtf8().constData());
+				return;
+			}
+			adapterConfig.insert(QStringLiteral("accessToken"), refreshed.accessToken);
+		}
+
+		QString title;
+		for (const auto &r : lastAcceptedRows_) {
+			if (r.platform == QStringLiteral("youtube") && r.enabled) {
+				title = r.title;
+				break;
+			}
+		}
+
+		const auto result = createYouTubeBroadcast(adapterConfig, title);
+		obs_log(result.ok ? LOG_INFO : LOG_WARNING, "Live Gate: %s", result.message.toUtf8().constData());
+	}
+
+	void applyAitumSelections()
+	{
+		// Start every non-YouTube output now, then give YouTube the stage to
+		// itself a few seconds later. Clicking the YouTube "go live" button in the
+		// same instant as Kick/Twitch races its broadcast lookup: it comes back
+		// "No active or pending YouTube broadcast found", the title push gives up,
+		// and the broadcast sticks on "Preparing stream" with healthy ingest.
+		// Staggering reproduces the known-good "start YouTube on its own" flow.
+		setAitumOutputs(true, AitumPhase::NonYouTube);
+
+		if (!hasPendingYouTube())
+			return;
+
+		QTimer::singleShot(kYouTubeStartDelayMs, this, [this] {
+			// Bail if the stream was stopped during the stagger window so we do
+			// not silently bring YouTube up after the user went offline.
+			if (!obs_frontend_streaming_active())
+				return;
+			// Create + bind a fresh broadcast FIRST so it is `ready` and bound
+			// before any ingest. Then clicking the Aitum YouTube output (below)
+			// is the off->on ingest edge that trips autostart -> live. Doing this
+			// in the reverse order is exactly what left the broadcast stuck on
+			// "Preparing stream" (the edge passed before the broadcast existed).
+			ensureYouTubeBroadcasts();
+			setAitumOutputs(true, AitumPhase::YouTubeOnly);
+			// The title is already set at broadcast creation; this remains as a
+			// fallback for a pinned/pre-existing broadcast and is a no-op otherwise.
+			publishPendingYouTubeTitles();
+		});
+	}
 
 	// Toggle the Aitum output "go live" buttons for the outputs we selected. Used
 	// to start them after OBS goes live and to stop them again when OBS stops, so
-	// the user does not have to click each Aitum output by hand.
-	void setAitumOutputs(bool live)
+	// the user does not have to click each Aitum output by hand. The phase lets the
+	// start path bring YouTube up on a separate, later pass (see applyAitumSelections).
+	void setAitumOutputs(bool live, AitumPhase phase = AitumPhase::All)
 	{
 		if (pendingAitumIds_.empty())
 			return;
@@ -1043,7 +1248,16 @@ private:
 				continue;
 
 			const bool selected = std::find(pendingAitumIds_.begin(), pendingAitumIds_.end(), outputName) != pendingAitumIds_.end();
-			if (selected && button->isChecked() != live) {
+			if (!selected)
+				continue;
+
+			const bool youtube = isYouTubeOutput(outputName);
+			if (phase == AitumPhase::NonYouTube && youtube)
+				continue;
+			if (phase == AitumPhase::YouTubeOnly && !youtube)
+				continue;
+
+			if (button->isChecked() != live) {
 				obs_log(LOG_INFO, "Live Gate %s Aitum output '%s'", live ? "starting" : "stopping",
 					outputName.toUtf8().constData());
 				button->click();
