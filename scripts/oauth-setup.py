@@ -121,15 +121,25 @@ def twitch_broadcaster_id(client_id, access_token):
     return data["data"][0]["id"]
 
 
-def write_settings(path, platform, entry):
+def write_settings(path, platform, entry, target=None):
     settings = {}
     if os.path.exists(path):
         with open(path) as handle:
             settings = json.load(handle)
     adapters = settings.setdefault("titleAdapters", {})
     existing = adapters.get(platform, {})
-    existing.update(entry)
-    existing["enabled"] = True
+    if target:
+        # Per-Stream-Target override: leave the shared block (the other
+        # channel's credentials) alone and store only what differs here.
+        # clientId/clientSecret/enabled fall through from the shared block.
+        targets = existing.setdefault("targets", {})
+        override = targets.get(target, {})
+        override.update({k: v for k, v in entry.items()
+                         if k in ("refreshToken", "broadcasterId")})
+        targets[target] = override
+    else:
+        existing.update(entry)
+        existing["enabled"] = True
     adapters[platform] = existing
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w") as handle:
@@ -145,6 +155,10 @@ def main():
     parser.add_argument("--client-secret", required=True)
     parser.add_argument("--settings", default=default_settings_path(),
                         help="path to settings.json (default: %(default)s)")
+    parser.add_argument("--target", default=None, metavar="KEY",
+                        help="Stream Target key (Twitch broadcaster id) to store these "
+                             "credentials under as a per-target override, instead of "
+                             "overwriting the shared adapter block")
     args = parser.parse_args()
 
     cfg = PLATFORMS[args.platform]
@@ -205,8 +219,14 @@ def main():
         print("\nYouTube will auto-detect your live/upcoming broadcast at go-live; "
               "no broadcastId needed.")
 
-    write_settings(args.settings, args.platform, entry)
-    print(f"\nDone. Wrote {args.platform} credentials to:\n  {args.settings}")
+    if args.target and args.platform == "twitch" and entry["broadcasterId"] != args.target:
+        sys.exit(f"\nRefusing to write: you authorized broadcaster {entry['broadcasterId']} "
+                 f"but --target is {args.target}. Log into the right Twitch account "
+                 f"(try a private window) and run this again.")
+
+    write_settings(args.settings, args.platform, entry, args.target)
+    where = f"{args.platform}.targets[{args.target}]" if args.target else args.platform
+    print(f"\nDone. Wrote {where} credentials to:\n  {args.settings}")
     print("Restart OBS for the plugin to pick them up.")
 
 

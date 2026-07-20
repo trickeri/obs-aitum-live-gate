@@ -126,6 +126,59 @@ bool writeJsonObject(const QString &path, const QJsonObject &object)
 	return true;
 }
 
+// The nuldrums OBS fork ships a "Stream Targets" dock (frontend/plugins/
+// nul-stream-targets) that swaps which channel the main stream goes to. It
+// records the selected target in its own plugin_config as activeUserId (the
+// Twitch broadcaster id parsed out of the stream key) plus a friendly
+// activeName. Live Gate follows that file so each channel keeps its own set of
+// titles: Trikeri_Omni and TroyWork no longer share one saved title per row.
+struct StreamTarget {
+	QString userId;
+	QString name;
+};
+
+// plugin_config/<name>, i.e. a sibling of our own module config directory.
+QString siblingPluginConfig(const QString &relativePath)
+{
+	const QString ownConfig = moduleConfigFile(QStringLiteral("settings.json"));
+	if (ownConfig.isEmpty())
+		return {};
+	QDir dir(QFileInfo(ownConfig).absoluteDir());
+	dir.cdUp();
+	return dir.filePath(relativePath);
+}
+
+StreamTarget activeStreamTarget()
+{
+	const auto object = readJsonObject(siblingPluginConfig(QStringLiteral("nul-stream-targets/targets.json")));
+	StreamTarget target;
+	target.userId = object.value(QStringLiteral("activeUserId")).toString().trimmed();
+	target.name = object.value(QStringLiteral("activeName")).toString().trimmed();
+	return target;
+}
+
+// Settings key for a target. The broadcaster id is stable across stream-key
+// rotations, so prefer it; fall back to the name, then to a shared bucket when
+// the Stream Targets dock isn't present or nothing is marked active.
+QString targetKey(const StreamTarget &target)
+{
+	if (!target.userId.isEmpty())
+		return target.userId;
+	if (!target.name.isEmpty())
+		return QStringLiteral("name:") + target.name;
+	return QStringLiteral("default");
+}
+
+QString targetLabel(const StreamTarget &target)
+{
+	if (!target.name.isEmpty())
+		return target.userId.isEmpty() ? target.name
+					       : QStringLiteral("%1 (%2)").arg(target.name, target.userId);
+	if (!target.userId.isEmpty())
+		return target.userId;
+	return {};
+}
+
 QString platformId(const QString &source, const QString &name)
 {
 	QString id = source + QStringLiteral(":") + name;
@@ -234,6 +287,36 @@ QJsonObject jsonObjectFromResponse(const HttpResponse &response)
 QString configString(const QJsonObject &config, const QString &key)
 {
 	return config.value(key).toString().trimmed();
+}
+
+// A title adapter may carry per-Stream-Target overrides:
+//
+//   "titleAdapters": {
+//     "twitch": {
+//       "enabled": true, "clientId": …, "clientSecret": …,
+//       "broadcasterId": "30852740", "refreshToken": …,      <- Trikeri_Omni
+//       "targets": {
+//         "1518269564": { "broadcasterId": "1518269564", "refreshToken": … }  <- TroyWork
+//       }
+//     }
+//   }
+//
+// Anything in the override wins; everything else (client id/secret, enabled)
+// falls through to the shared block, so a second channel usually only needs its
+// own broadcasterId + refreshToken.
+QJsonObject adapterOverrideFor(const QJsonObject &adapter, const QString &key)
+{
+	return adapter.value(QStringLiteral("targets")).toObject().value(key).toObject();
+}
+
+QJsonObject effectiveAdapter(const QJsonObject &adapter, const QString &key)
+{
+	QJsonObject merged = adapter;
+	merged.remove(QStringLiteral("targets"));
+	const auto override = adapterOverrideFor(adapter, key);
+	for (auto it = override.begin(); it != override.end(); ++it)
+		merged.insert(it.key(), it.value());
+	return merged;
 }
 
 TitlePublishResult updateTwitchTitle(const QJsonObject &config, const QString &title)
@@ -579,7 +662,8 @@ TokenRefreshResult refreshAccessToken(const QString &platform, const QJsonObject
 
 class GoLiveDialog final : public QDialog {
 public:
-	explicit GoLiveDialog(std::vector<PlatformRow> rows, QWidget *parent = nullptr, bool previewOnly = false)
+	explicit GoLiveDialog(std::vector<PlatformRow> rows, const QString &target, QWidget *parent = nullptr,
+			      bool previewOnly = false)
 		: QDialog(parent),
 		  rows_(std::move(rows)),
 		  previewOnly_(previewOnly)
@@ -592,6 +676,20 @@ public:
 		auto *intro = new QLabel(previewOnly ? text("LiveGate.PreviewIntro") : text("LiveGate.Intro"), this);
 		intro->setWordWrap(true);
 		root->addWidget(intro);
+
+		// Titles are saved per Stream Target, so say out loud which channel's
+		// set is on screen -- otherwise an unexpected title looks like a bug.
+		auto *targetLabelWidget = new QLabel(this);
+		targetLabelWidget->setWordWrap(true);
+		if (target.isEmpty()) {
+			targetLabelWidget->setText(QStringLiteral(
+				"No Stream Target detected — using the shared title set."));
+		} else {
+			targetLabelWidget->setText(
+				QStringLiteral("Stream Target: <b>%1</b> — titles below are saved for this target only.")
+					.arg(target.toHtmlEscaped()));
+		}
+		root->addWidget(targetLabelWidget);
 
 		auto *grid = new QGridLayout;
 		grid->setColumnStretch(2, 1);
@@ -859,9 +957,13 @@ private:
 
 	void showGateDialog()
 	{
+		// Pin the target for the whole go-live pass: the Stream Targets dock
+		// refuses to switch while streaming, so this stays valid through the
+		// staggered YouTube start and the deferred title retries.
+		activeTarget_ = activeStreamTarget();
 		auto rows = loadRows();
 		auto *mainWindow = reinterpret_cast<QWidget *>(obs_frontend_get_main_window());
-		GoLiveDialog dialog(std::move(rows), mainWindow);
+		GoLiveDialog dialog(std::move(rows), targetLabel(activeTarget_), mainWindow);
 		const bool accepted = dialog.exec() == QDialog::Accepted;
 
 		// Cancel/Escape/window-close discards: the dialog already confirmed
@@ -922,16 +1024,30 @@ private:
 
 	void showPreviewDialog()
 	{
+		activeTarget_ = activeStreamTarget();
 		auto rows = loadRows();
 		auto *mainWindow = reinterpret_cast<QWidget *>(obs_frontend_get_main_window());
-		GoLiveDialog dialog(std::move(rows), mainWindow, true);
+		GoLiveDialog dialog(std::move(rows), targetLabel(activeTarget_), mainWindow, true);
 		dialog.exec();
+	}
+
+	// Saved rows for the active Stream Target. A target that has never been
+	// saved inherits the legacy top-level "platforms" block, so the first
+	// go-live after this change opens with the titles you already had.
+	QJsonObject savedPlatforms() const
+	{
+		const QJsonObject root = readJsonObject(settingsPath());
+		const QJsonObject targets = root.value(QStringLiteral("targets")).toObject();
+		const QString key = targetKey(activeTarget_);
+		if (targets.contains(key))
+			return targets.value(key).toObject().value(QStringLiteral("platforms")).toObject();
+		return root.value(QStringLiteral("platforms")).toObject();
 	}
 
 	std::vector<PlatformRow> loadRows() const
 	{
 		std::vector<PlatformRow> rows;
-		const auto saved = readJsonObject(settingsPath()).value(QStringLiteral("platforms")).toObject();
+		const auto saved = savedPlatforms();
 
 		PlatformRow main;
 		main.id = platformId(QStringLiteral("obs"), text("LiveGate.ObsMain"));
@@ -998,13 +1114,7 @@ private:
 
 	QString aitumConfigPath() const
 	{
-		const QString ownConfig = moduleConfigFile(QStringLiteral("settings.json"));
-		if (ownConfig.isEmpty())
-			return {};
-
-		QDir dir(QFileInfo(ownConfig).absoluteDir());
-		dir.cdUp();
-		return dir.filePath(QStringLiteral("aitum-multistream/config.json"));
+		return siblingPluginConfig(QStringLiteral("aitum-multistream/config.json"));
 	}
 
 	void saveRows(const std::vector<PlatformRow> &rows) const
@@ -1022,7 +1132,16 @@ private:
 			platforms.insert(row.id, object);
 		}
 		root.insert(QStringLiteral("profile"), currentProfileName());
-		root.insert(QStringLiteral("platforms"), platforms);
+
+		// Write under the active target rather than the shared top-level
+		// "platforms" block, which is left in place as the seed any target
+		// inherits until it has been saved once.
+		QJsonObject targets = root.value(QStringLiteral("targets")).toObject();
+		QJsonObject entry = targets.value(targetKey(activeTarget_)).toObject();
+		entry.insert(QStringLiteral("name"), activeTarget_.name);
+		entry.insert(QStringLiteral("platforms"), platforms);
+		targets.insert(targetKey(activeTarget_), entry);
+		root.insert(QStringLiteral("targets"), targets);
 		if (!writeJsonObject(settingsPath(), root))
 			obs_log(LOG_WARNING, "Live Gate failed to save settings to %s", settingsPath().toUtf8().constData());
 	}
@@ -1034,9 +1153,26 @@ private:
 	{
 		QJsonObject root = readJsonObject(settingsPath());
 		QJsonObject adapters = root.value(QStringLiteral("titleAdapters")).toObject();
-		QJsonObject adapterConfig = adapters.value(row.platform).toObject();
+		const QString key = targetKey(activeTarget_);
+		QJsonObject base = adapters.value(row.platform).toObject();
+		QJsonObject adapterConfig = effectiveAdapter(base, key);
 		if (!adapterConfig.value(QStringLiteral("enabled")).toBool(false))
 			return {true, false, QStringLiteral("%1 adapter is not enabled; title not updated.").arg(row.platform)};
+
+		// A Twitch token is bound to one channel. The Stream Target's id *is*
+		// the Twitch broadcaster id, so if the adapter points somewhere else we
+		// are about to retitle the wrong channel -- refuse instead.
+		if (row.platform == QStringLiteral("twitch")) {
+			const QString adapterBroadcaster = configString(adapterConfig, QStringLiteral("broadcasterId"));
+			if (!adapterBroadcaster.isEmpty() && !activeTarget_.userId.isEmpty() &&
+			    adapterBroadcaster != activeTarget_.userId)
+				return {true, false,
+					QStringLiteral("Twitch adapter targets broadcaster %1 but the active Stream Target is "
+						       "%2. Skipped so the wrong channel is not retitled — add "
+						       "titleAdapters.twitch.targets[\"%3\"] with this channel's broadcasterId "
+						       "and refreshToken.")
+						.arg(adapterBroadcaster, targetLabel(activeTarget_), key)};
+		}
 
 		if (!configString(adapterConfig, QStringLiteral("refreshToken")).isEmpty()) {
 			const auto refreshed = refreshAccessToken(row.platform, adapterConfig);
@@ -1044,8 +1180,19 @@ private:
 				return {true, false, refreshed.error};
 			adapterConfig.insert(QStringLiteral("accessToken"), refreshed.accessToken);
 			if (!refreshed.refreshToken.isEmpty()) {
-				adapterConfig.insert(QStringLiteral("refreshToken"), refreshed.refreshToken);
-				adapters.insert(row.platform, adapterConfig);
+				// Persist the rotated token back where it came from: the
+				// per-target override if that is what supplied it, otherwise
+				// the shared block.
+				QJsonObject override = adapterOverrideFor(base, key);
+				if (!configString(override, QStringLiteral("refreshToken")).isEmpty()) {
+					override.insert(QStringLiteral("refreshToken"), refreshed.refreshToken);
+					QJsonObject targets = base.value(QStringLiteral("targets")).toObject();
+					targets.insert(key, override);
+					base.insert(QStringLiteral("targets"), targets);
+				} else {
+					base.insert(QStringLiteral("refreshToken"), refreshed.refreshToken);
+				}
+				adapters.insert(row.platform, base);
 				root.insert(QStringLiteral("titleAdapters"), adapters);
 				if (!writeJsonObject(settingsPath(), root))
 					obs_log(LOG_WARNING, "Live Gate failed to persist rotated refresh token to %s",
@@ -1160,8 +1307,12 @@ private:
 		if (!hasPendingYouTube())
 			return;
 
-		QJsonObject adapterConfig =
-			readJsonObject(settingsPath()).value(QStringLiteral("titleAdapters")).toObject().value(QStringLiteral("youtube")).toObject();
+		QJsonObject adapterConfig = effectiveAdapter(readJsonObject(settingsPath())
+								     .value(QStringLiteral("titleAdapters"))
+								     .toObject()
+								     .value(QStringLiteral("youtube"))
+								     .toObject(),
+							     targetKey(activeTarget_));
 		if (!adapterConfig.value(QStringLiteral("enabled")).toBool(false)) {
 			obs_log(LOG_INFO, "Live Gate: YouTube adapter disabled; not creating a broadcast.");
 			return;
@@ -1267,6 +1418,9 @@ private:
 
 	bool showingDialog_ = false;
 	bool programmaticStart_ = false;
+	// Which Stream Target this go-live pass belongs to; pinned when the dialog
+	// opens and used for every title lookup and save afterwards.
+	StreamTarget activeTarget_;
 	std::vector<QString> pendingAitumIds_;
 	std::vector<PlatformRow> lastAcceptedRows_;
 	std::vector<PlatformRow> pendingYouTubeRows_;
