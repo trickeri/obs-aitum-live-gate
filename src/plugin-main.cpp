@@ -38,6 +38,7 @@ license text.
 #include <QNetworkRequest>
 #include <QPointer>
 #include <QPushButton>
+#include <QRegularExpression>
 #include <QStringList>
 #include <QTimer>
 #include <QUrl>
@@ -78,6 +79,36 @@ struct TitlePublishResult {
 };
 
 using Headers = std::vector<std::pair<QByteArray, QByteArray>>;
+
+// Twitch-only channel info set alongside the title. An empty category or tag
+// list means "leave whatever the channel already has".
+struct TwitchChannelInfo {
+	QString category;
+	QStringList tags;
+};
+
+// Twitch tags: at most 10, each at most 25 characters, letters and numbers only
+// (no spaces or symbols). Accepts comma- or whitespace-separated input and
+// quietly drops what Twitch would reject instead of failing the whole update.
+QStringList sanitizeTwitchTags(const QString &input)
+{
+	static constexpr int kMaxTags = 10;
+	static constexpr int kMaxTagLength = 25;
+	QStringList tags;
+	for (const auto &raw : input.split(QRegularExpression(QStringLiteral("[,\\s]+")), Qt::SkipEmptyParts)) {
+		QString tag;
+		for (const QChar c : raw)
+			if (c.isLetterOrNumber())
+				tag.append(c);
+		tag.truncate(kMaxTagLength);
+		if (tag.isEmpty() || tags.contains(tag, Qt::CaseInsensitive))
+			continue;
+		tags.push_back(tag);
+		if (tags.size() == kMaxTags)
+			break;
+	}
+	return tags;
+}
 
 QString text(const char *key)
 {
@@ -319,7 +350,48 @@ QJsonObject effectiveAdapter(const QJsonObject &adapter, const QString &key)
 	return merged;
 }
 
-TitlePublishResult updateTwitchTitle(const QJsonObject &config, const QString &title)
+struct TwitchCategoryLookup {
+	QString id;
+	QString name;
+	QString error;
+};
+
+// Resolve a category name to Helix's game_id. An exact name match wins; failing
+// that, take Twitch's own top search hit so "aion 2" still finds "Aion 2".
+TwitchCategoryLookup lookupTwitchCategory(const Headers &headers, const QString &name)
+{
+	QUrl gamesUrl(QStringLiteral("https://api.twitch.tv/helix/games"));
+	QUrlQuery gamesQuery;
+	gamesQuery.addQueryItem(QStringLiteral("name"), name);
+	gamesUrl.setQuery(gamesQuery);
+	const auto games = sendRequest("GET", gamesUrl, headers);
+	if (games.statusCode != 200)
+		return {{}, {},
+			QStringLiteral("category lookup failed (%1): %2").arg(games.statusCode).arg(QString::fromUtf8(games.body))};
+	auto data = jsonObjectFromResponse(games).value(QStringLiteral("data")).toArray();
+
+	if (data.isEmpty()) {
+		QUrl searchUrl(QStringLiteral("https://api.twitch.tv/helix/search/categories"));
+		QUrlQuery searchQuery;
+		searchQuery.addQueryItem(QStringLiteral("query"), name);
+		searchQuery.addQueryItem(QStringLiteral("first"), QStringLiteral("1"));
+		searchUrl.setQuery(searchQuery);
+		const auto search = sendRequest("GET", searchUrl, headers);
+		if (search.statusCode != 200)
+			return {{}, {},
+				QStringLiteral("category search failed (%1): %2")
+					.arg(search.statusCode)
+					.arg(QString::fromUtf8(search.body))};
+		data = jsonObjectFromResponse(search).value(QStringLiteral("data")).toArray();
+	}
+
+	if (data.isEmpty())
+		return {{}, {}, QStringLiteral("no Twitch category matches '%1'").arg(name)};
+	const auto game = data.first().toObject();
+	return {game.value(QStringLiteral("id")).toString(), game.value(QStringLiteral("name")).toString(), {}};
+}
+
+TitlePublishResult updateTwitchTitle(const QJsonObject &config, const QString &title, const TwitchChannelInfo &info)
 {
 	const QString clientId = configString(config, QStringLiteral("clientId"));
 	const QString broadcasterId = configString(config, QStringLiteral("broadcasterId"));
@@ -327,23 +399,54 @@ TitlePublishResult updateTwitchTitle(const QJsonObject &config, const QString &t
 	if (clientId.isEmpty() || broadcasterId.isEmpty() || accessToken.isEmpty())
 		return {true, false, QStringLiteral("Twitch adapter needs clientId, broadcasterId, and accessToken.")};
 
+	const Headers headers{{"Authorization", "Bearer " + accessToken.toUtf8()},
+			      {"Client-Id", clientId.toUtf8()},
+			      {"Content-Type", "application/json"}};
+
+	// A category that cannot be resolved is reported but does not block the
+	// title and tags from going out.
+	QJsonObject payload;
+	QStringList notes;
+	if (!title.isEmpty())
+		payload.insert(QStringLiteral("title"), title);
+	if (!info.category.isEmpty()) {
+		const auto category = lookupTwitchCategory(headers, info.category);
+		if (category.id.isEmpty())
+			notes.push_back(category.error);
+		else
+			payload.insert(QStringLiteral("game_id"), category.id);
+		if (!category.name.isEmpty() && category.name.compare(info.category, Qt::CaseInsensitive) != 0)
+			notes.push_back(QStringLiteral("category '%1' matched '%2'").arg(info.category, category.name));
+	}
+	if (!info.tags.isEmpty())
+		payload.insert(QStringLiteral("tags"), QJsonArray::fromStringList(info.tags));
+	if (payload.isEmpty())
+		return {true, false, QStringLiteral("Twitch update skipped: ") + notes.join(QStringLiteral("; "))};
+
 	QUrl url(QStringLiteral("https://api.twitch.tv/helix/channels"));
 	QUrlQuery query;
 	query.addQueryItem(QStringLiteral("broadcaster_id"), broadcasterId);
 	url.setQuery(query);
 
-	const QJsonObject payload{{QStringLiteral("title"), title}};
-	const auto response = sendRequest(
-		"PATCH", url,
-		{{"Authorization", "Bearer " + accessToken.toUtf8()},
-		 {"Client-Id", clientId.toUtf8()},
-		 {"Content-Type", "application/json"}},
-		QJsonDocument(payload).toJson(QJsonDocument::Compact));
+	const auto response = sendRequest("PATCH", url, headers, QJsonDocument(payload).toJson(QJsonDocument::Compact));
 
-	if (response.statusCode == 204)
-		return {true, true, QStringLiteral("Twitch title updated.")};
-	return {true, false,
-		QStringLiteral("Twitch title update failed (%1): %2").arg(response.statusCode).arg(QString::fromUtf8(response.body))};
+	if (response.statusCode != 204)
+		return {true, false,
+			QStringLiteral("Twitch channel update failed (%1): %2").arg(response.statusCode).arg(QString::fromUtf8(response.body))};
+
+	QStringList updated;
+	if (payload.contains(QStringLiteral("title")))
+		updated.push_back(QStringLiteral("title"));
+	if (payload.contains(QStringLiteral("game_id")))
+		updated.push_back(QStringLiteral("category"));
+	if (payload.contains(QStringLiteral("tags")))
+		updated.push_back(QStringLiteral("tags"));
+	const QString message = QStringLiteral("Twitch %1 updated.").arg(updated.join(QStringLiteral(", ")));
+	if (notes.isEmpty())
+		return {true, true, message};
+	// Only a missed category counts as a failure; a fuzzy match is just noted.
+	return {true, payload.contains(QStringLiteral("game_id")) || info.category.isEmpty(),
+		message + QStringLiteral(" (") + notes.join(QStringLiteral("; ")) + QStringLiteral(")")};
 }
 
 TitlePublishResult updateKickTitle(const QJsonObject &config, const QString &title)
@@ -586,10 +689,11 @@ BroadcastResult createYouTubeBroadcast(const QJsonObject &config, const QString 
 		QStringLiteral("Created and bound YouTube broadcast %1 (autostart on, monitor off).").arg(broadcastId)};
 }
 
-TitlePublishResult publishPlatformTitle(const QString &platform, const QJsonObject &adapterConfig, const QString &title)
+TitlePublishResult publishPlatformTitle(const QString &platform, const QJsonObject &adapterConfig, const QString &title,
+				       const TwitchChannelInfo &twitch = {})
 {
 	if (platform == QStringLiteral("twitch"))
-		return updateTwitchTitle(adapterConfig, title);
+		return updateTwitchTitle(adapterConfig, title, twitch);
 	if (platform == QStringLiteral("youtube"))
 		return updateYouTubeTitle(adapterConfig, title);
 	if (platform == QStringLiteral("kick"))
@@ -662,8 +766,8 @@ TokenRefreshResult refreshAccessToken(const QString &platform, const QJsonObject
 
 class GoLiveDialog final : public QDialog {
 public:
-	explicit GoLiveDialog(std::vector<PlatformRow> rows, const QString &target, QWidget *parent = nullptr,
-			      bool previewOnly = false)
+	explicit GoLiveDialog(std::vector<PlatformRow> rows, const QString &target, const TwitchChannelInfo &twitch,
+			      const QStringList &recentCategories, QWidget *parent = nullptr, bool previewOnly = false)
 		: QDialog(parent),
 		  rows_(std::move(rows)),
 		  previewOnly_(previewOnly)
@@ -778,6 +882,39 @@ public:
 
 		root->addLayout(grid);
 
+		// Twitch channel info goes out in the same Helix PATCH as the title, to
+		// whichever Twitch row(s) are going live. Blank fields leave the channel's
+		// current category/tags alone.
+		auto *twitchGrid = new QGridLayout;
+		twitchGrid->setColumnStretch(1, 1);
+		auto *twitchHeader = new QLabel(this);
+		const QPixmap twitchIcon(platformIconPath(QStringLiteral("twitch")));
+		twitchHeader->setText(QStringLiteral("<b>Twitch</b>"));
+		auto *twitchHeaderRow = new QHBoxLayout;
+		if (!twitchIcon.isNull()) {
+			auto *icon = new QLabel(this);
+			icon->setPixmap(twitchIcon.scaled(kIconSize, kIconSize, Qt::KeepAspectRatio, Qt::SmoothTransformation));
+			twitchHeaderRow->addWidget(icon);
+		}
+		twitchHeaderRow->addWidget(twitchHeader);
+		twitchHeaderRow->addStretch();
+		root->addLayout(twitchHeaderRow);
+
+		twitchCategory_ = new QComboBox(this);
+		twitchCategory_->setEditable(true);
+		twitchCategory_->setInsertPolicy(QComboBox::NoInsert);
+		twitchCategory_->addItems(recentCategories);
+		twitchCategory_->setCurrentText(twitch.category);
+		twitchCategory_->lineEdit()->setPlaceholderText(QStringLiteral("e.g. Aion 2, Software and Game Development"));
+		twitchGrid->addWidget(new QLabel(QStringLiteral("Category"), this), 0, 0);
+		twitchGrid->addWidget(twitchCategory_, 0, 1);
+
+		twitchTags_ = new QLineEdit(twitch.tags.join(QStringLiteral(", ")), this);
+		twitchTags_->setPlaceholderText(QStringLiteral("Up to 10, comma-separated, letters/numbers only"));
+		twitchGrid->addWidget(new QLabel(QStringLiteral("Tags"), this), 1, 0);
+		twitchGrid->addWidget(twitchTags_, 1, 1);
+		root->addLayout(twitchGrid);
+
 		if (rows_.size() <= 1) {
 			auto *hint = new QLabel(text("LiveGate.NoAitumOutputs"), this);
 			hint->setWordWrap(true);
@@ -802,6 +939,13 @@ public:
 		for (auto *edit : titleEdits_)
 			initialTitles_.push_back(edit->text());
 		initialPlatform_ = mainPlatformCombo_ ? mainPlatformCombo_->currentData().toString() : QString();
+		initialCategory_ = twitchCategory_->currentText();
+		initialTags_ = twitchTags_->text();
+	}
+
+	TwitchChannelInfo twitchInfo() const
+	{
+		return {twitchCategory_->currentText().trimmed(), sanitizeTwitchTags(twitchTags_->text())};
 	}
 
 	std::vector<PlatformRow> rows() const
@@ -842,7 +986,7 @@ private:
 				return true;
 		if (mainPlatformCombo_ && mainPlatformCombo_->currentData().toString() != initialPlatform_)
 			return true;
-		return false;
+		return twitchCategory_->currentText() != initialCategory_ || twitchTags_->text() != initialTags_;
 	}
 
 	static void addPlatformItem(QComboBox *combo, const QString &platform, const QString &label)
@@ -859,9 +1003,13 @@ private:
 	std::vector<QCheckBox *> enabledBoxes_;
 	std::vector<QLineEdit *> titleEdits_;
 	QComboBox *mainPlatformCombo_ = nullptr;
+	QComboBox *twitchCategory_ = nullptr;
+	QLineEdit *twitchTags_ = nullptr;
 	std::vector<bool> initialEnabled_;
 	std::vector<QString> initialTitles_;
 	QString initialPlatform_;
+	QString initialCategory_;
+	QString initialTags_;
 };
 
 class LiveGateController final : public QObject {
@@ -963,7 +1111,8 @@ private:
 		activeTarget_ = activeStreamTarget();
 		auto rows = loadRows();
 		auto *mainWindow = reinterpret_cast<QWidget *>(obs_frontend_get_main_window());
-		GoLiveDialog dialog(std::move(rows), targetLabel(activeTarget_), mainWindow);
+		GoLiveDialog dialog(std::move(rows), targetLabel(activeTarget_), loadTwitchInfo(), recentTwitchCategories(),
+				    mainWindow);
 		const bool accepted = dialog.exec() == QDialog::Accepted;
 
 		// Cancel/Escape/window-close discards: the dialog already confirmed
@@ -974,7 +1123,9 @@ private:
 
 		// Persist only the choices the user actually committed by going live.
 		const auto editedRows = dialog.rows();
+		twitchInfo_ = dialog.twitchInfo();
 		saveRows(editedRows);
+		saveTwitchInfo(twitchInfo_);
 
 		lastAcceptedRows_ = editedRows;
 
@@ -1027,7 +1178,8 @@ private:
 		activeTarget_ = activeStreamTarget();
 		auto rows = loadRows();
 		auto *mainWindow = reinterpret_cast<QWidget *>(obs_frontend_get_main_window());
-		GoLiveDialog dialog(std::move(rows), targetLabel(activeTarget_), mainWindow, true);
+		GoLiveDialog dialog(std::move(rows), targetLabel(activeTarget_), loadTwitchInfo(), recentTwitchCategories(),
+				    mainWindow, true);
 		dialog.exec();
 	}
 
@@ -1111,6 +1263,57 @@ private:
 	}
 
 	QString settingsPath() const { return moduleConfigFile(QStringLiteral("settings.json")); }
+
+	// Twitch category/tags live beside the rows under the active target, so each
+	// channel remembers its own; a never-saved target starts blank.
+	TwitchChannelInfo loadTwitchInfo() const
+	{
+		const auto twitch = readJsonObject(settingsPath())
+					    .value(QStringLiteral("targets"))
+					    .toObject()
+					    .value(targetKey(activeTarget_))
+					    .toObject()
+					    .value(QStringLiteral("twitch"))
+					    .toObject();
+		TwitchChannelInfo info;
+		info.category = twitch.value(QStringLiteral("category")).toString();
+		for (const auto tag : twitch.value(QStringLiteral("tags")).toArray())
+			info.tags.push_back(tag.toString());
+		return info;
+	}
+
+	// Most-recent-first list of categories used on any target, for the dropdown.
+	QStringList recentTwitchCategories() const
+	{
+		QStringList recent;
+		for (const auto value : readJsonObject(settingsPath()).value(QStringLiteral("twitchRecentCategories")).toArray())
+			recent.push_back(value.toString());
+		return recent;
+	}
+
+	void saveTwitchInfo(const TwitchChannelInfo &info) const
+	{
+		static constexpr int kMaxRecentCategories = 15;
+		QJsonObject root = readJsonObject(settingsPath());
+		QJsonObject targets = root.value(QStringLiteral("targets")).toObject();
+		QJsonObject entry = targets.value(targetKey(activeTarget_)).toObject();
+		entry.insert(QStringLiteral("twitch"),
+			     QJsonObject{{QStringLiteral("category"), info.category},
+					 {QStringLiteral("tags"), QJsonArray::fromStringList(info.tags)}});
+		targets.insert(targetKey(activeTarget_), entry);
+		root.insert(QStringLiteral("targets"), targets);
+
+		if (!info.category.isEmpty()) {
+			QStringList recent = recentTwitchCategories();
+			recent.removeIf([&](const QString &c) { return c.compare(info.category, Qt::CaseInsensitive) == 0; });
+			recent.prepend(info.category);
+			while (recent.size() > kMaxRecentCategories)
+				recent.removeLast();
+			root.insert(QStringLiteral("twitchRecentCategories"), QJsonArray::fromStringList(recent));
+		}
+		if (!writeJsonObject(settingsPath(), root))
+			obs_log(LOG_WARNING, "Live Gate failed to save Twitch info to %s", settingsPath().toUtf8().constData());
+	}
 
 	QString aitumConfigPath() const
 	{
@@ -1200,7 +1403,7 @@ private:
 			}
 		}
 
-		return publishPlatformTitle(row.platform, adapterConfig, row.title);
+		return publishPlatformTitle(row.platform, adapterConfig, row.title, twitchInfo_);
 	}
 
 	bool publishTitles(QStringList &warnings)
@@ -1211,7 +1414,10 @@ private:
 		pendingYouTubeRows_.clear();
 
 		for (const auto &row : lastAcceptedRows_) {
-			if (!row.enabled || row.title.isEmpty())
+			// A Twitch row with no title still pushes its category/tags.
+			const bool twitchExtras = row.platform == QStringLiteral("twitch") &&
+						  (!twitchInfo_.category.isEmpty() || !twitchInfo_.tags.isEmpty());
+			if (!row.enabled || (row.title.isEmpty() && !twitchExtras))
 				continue;
 
 			if (row.platform.isEmpty()) {
@@ -1424,6 +1630,7 @@ private:
 	std::vector<QString> pendingAitumIds_;
 	std::vector<PlatformRow> lastAcceptedRows_;
 	std::vector<PlatformRow> pendingYouTubeRows_;
+	TwitchChannelInfo twitchInfo_;
 };
 
 std::unique_ptr<LiveGateController> controller;

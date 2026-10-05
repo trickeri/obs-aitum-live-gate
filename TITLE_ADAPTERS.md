@@ -45,6 +45,13 @@ Implemented via Twitch Helix **Modify Channel Information**:
 PATCH https://api.twitch.tv/helix/channels?broadcaster_id=...
 ```
 
+The same PATCH also carries the **Category** and **Tags** from the Twitch section
+of the Go Live popup (saved per Stream Target under `targets.<id>.twitch`). The
+category name is resolved to a `game_id` via `GET /helix/games?name=…`, falling
+back to the top `GET /helix/search/categories` hit. Tags are cleaned to Twitch's
+rules (max 10, max 25 chars, letters/numbers only). A blank category or tag field
+leaves the channel's current value alone.
+
 You need:
 
 - a Twitch Developer app: its **client ID** and **client secret**
